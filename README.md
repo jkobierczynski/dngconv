@@ -26,6 +26,15 @@ Status: **0.2.0, early**. It works on the cameras listed under
 - `--verify` re-reads each DNG and compares every sample with the source.
 - Writes through a temporary file, so an interrupted run leaves no half DNG.
 
+## Download
+
+Tagged releases on GitHub carry ready-made binaries for Linux (x86_64), macOS
+(Apple Silicon) and Windows (x64). They are self-contained: LibRaw is linked
+in. Unpack the archive and run `dngconv` from a terminal.
+
+The binaries are built by `.github/workflows/release.yml` whenever a version
+tag is pushed; see `DEVELOPMENT.md` for how a release is made.
+
 ## Build
 
 Needs CMake 3.16+, a C++17 compiler and LibRaw 0.21 or newer.
@@ -265,6 +274,8 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.
+
+Development history, design decisions and open work are in `DEVELOPMENT.md`.
 
 ## Licence
 

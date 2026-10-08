@@ -1,0 +1,218 @@
+# Builds self-contained dngconv binaries for Linux, macOS and Windows and
+# attaches them to a GitHub release.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag must match the version in CMakeLists.txt ("v0.2.0" or "v0.2.0-rc1"
+# for version 0.2.0). The release is created as a draft, filled by the three
+# build jobs, and published only when all of them succeeded.
+#
+# "Run workflow" on the Actions page builds the same packages without making a
+# release; they are then available as workflow artifacts.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # LibRaw and its dependencies are built from source by vcpkg and linked
+  # statically, so the binaries need nothing installed. This is the vcpkg
+  # revision used; change it to pick up a newer LibRaw (more cameras).
+  VCPKG_COMMIT: 264e86adc7ed96c8cbfae64c1ff98bd833870ae7
+  VCPKG_DISABLE_METRICS: "1"
+
+jobs:
+  prepare:
+    name: Check version
+    runs-on: ubuntu-24.04
+    outputs:
+      label: ${{ steps.version.outputs.label }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare the tag with the project version
+        id: version
+        run: |
+          version=$(sed -n 's/^project(dngconv VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ -z "$version" ]; then
+            echo "::error::Cannot read the version from CMakeLists.txt"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            label=${GITHUB_REF_NAME#v}
+            if [ "${label%%-*}" != "$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version in CMakeLists.txt"
+              exit 1
+            fi
+          else
+            label="$version-${GITHUB_SHA::7}"
+          fi
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "Packages will be named dngconv-$label-<platform>"
+
+      - name: Create the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME exists already; its files will be replaced."
+            exit 0
+          fi
+          flags=(--draft --verify-tag --generate-notes --title "dngconv ${GITHUB_REF_NAME#v}")
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            platform: linux-x86_64
+            triplet: x64-linux-release
+            # Do not depend on the build machine's C++ runtime version.
+            cmake_args: '"-DCMAKE_EXE_LINKER_FLAGS=-static-libgcc -static-libstdc++"'
+          - name: macOS arm64
+            os: macos-15
+            platform: macos-arm64
+            triplet: arm64-osx-release
+            cmake_args: ""
+          - name: Windows x64
+            os: windows-2025
+            platform: windows-x64
+            triplet: x64-windows-static-release
+            # Static C runtime, matching the vcpkg triplet: no redistributable needed.
+            cmake_args: "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+    defaults:
+      run:
+        shell: bash
+    env:
+      PACKAGE: dngconv-${{ needs.prepare.outputs.label }}-${{ matrix.platform }}
+      TRIPLET: ${{ matrix.triplet }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch vcpkg
+        run: |
+          git init -q vcpkg
+          git -C vcpkg fetch -q --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_COMMIT"
+          git -C vcpkg checkout -q FETCH_HEAD
+
+      - name: Bootstrap vcpkg (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkgconf || true
+
+      - name: Build LibRaw
+        run: ./vcpkg/vcpkg install "libraw:$TRIPLET" --clean-after-build
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_TARGET_TRIPLET="$TRIPLET"
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        run: |
+          # Single-configuration generators put the binary in build/, Visual
+          # Studio puts it in build/Release/.
+          exe=build/dngconv
+          [ -f build/Release/dngconv.exe ] && exe=build/Release/dngconv.exe
+          "$exe" --version
+
+          mkdir -p "$PACKAGE/licenses"
+          cp "$exe" README.md LICENSE "$PACKAGE/"
+
+          # The licences of everything linked into the binary.
+          for dir in "vcpkg/installed/$TRIPLET/share"/*/; do
+            if [ -f "$dir/copyright" ]; then
+              cp "$dir/copyright" "$PACKAGE/licenses/$(basename "$dir").txt"
+            fi
+          done
+          ls "$PACKAGE" "$PACKAGE/licenses"
+
+          case "$RUNNER_OS" in
+            Windows)
+              asset="$PACKAGE.zip"
+              7z a -bd "$asset" "$PACKAGE" > /dev/null
+              sha256sum "$asset" > "$asset.sha256"
+              ;;
+            macOS)
+              strip "$PACKAGE/dngconv"
+              otool -L "$PACKAGE/dngconv"
+              asset="$PACKAGE.tar.gz"
+              tar -czf "$asset" "$PACKAGE"
+              shasum -a 256 "$asset" > "$asset.sha256"
+              ;;
+            *)
+              strip "$PACKAGE/dngconv"
+              ldd "$PACKAGE/dngconv"
+              asset="$PACKAGE.tar.gz"
+              tar -czf "$asset" "$PACKAGE"
+              sha256sum "$asset" > "$asset.sha256"
+              ;;
+          esac
+          cat "$asset.sha256"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Keep the package as a workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+      - name: Attach the package to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" --clobber
+
+  publish:
+    name: Publish the release
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
