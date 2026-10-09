@@ -14,6 +14,7 @@
 
 #include <libraw/libraw.h>
 
+#include "lens_data.hpp"
 #include "original_raw.hpp"
 #include "source_metadata.hpp"
 
@@ -384,6 +385,11 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
         }
     }
 
+    // The picture as the camera frames it, before the margin below is taken
+    // off: the camera's lens corrections are laid out over this rectangle.
+    const double pictureLeft = img.cropLeft, pictureTop = img.cropTop;
+    const double pictureWidth = img.cropWidth, pictureHeight = img.cropHeight;
+
     // Keep a margin between the default crop and the edge of the active area.
     // Interpolating a mosaic needs neighbours on every side, and DNG readers
     // complain about less than two pixels. Two keeps the Bayer phase.
@@ -483,6 +489,15 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
         if (original.identityFound()) {
             img.make = original.make;
             img.model = original.model;
+        }
+        // Lens-correction parameters, in whatever private corner of the file
+        // the maker keeps them.
+        if (options.readLensData) {
+            img.lens = readLensData(path, original.metadata.makerNote, pictureWidth, pictureHeight);
+            img.lens.frameLeft = pictureLeft;
+            img.lens.frameTop = pictureTop;
+            img.lens.frameWidth = pictureWidth;
+            img.lens.frameHeight = pictureHeight;
         }
         if (options.copyMetadata) img.source = std::move(original.metadata);
     }

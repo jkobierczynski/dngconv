@@ -1,10 +1,11 @@
 # Development notes
 
-Where dngconv stands, how it got there, and what comes next. The README says
-what the program does; this file records the progress and the reasons behind
-the decisions, so that work can be picked up again without rediscovering them.
+Where dngconv stands and how it got there. The README says what the program
+does; this file records the progress and the reasons behind the decisions, so
+that work can be picked up again without rediscovering them. What is left to
+do is in `TODO.md`.
 
-Last updated: 2026-10-09, at version 0.4.0.
+Last updated: 2026-10-09, at version 0.5.0.
 
 ## Status at a glance
 
@@ -20,14 +21,15 @@ Last updated: 2026-10-09, at version 0.4.0.
 | Digests | `NewRawImageDigest` and `RawDataUniqueID`; the former confirmed by Adobe's validator |
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
+| Lens corrections as opcodes | Sony, Fujifilm, Panasonic, Olympus; distortion checked against each camera's own JPEG on five files |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
-| macOS and Windows builds | Written, **never run** |
-| Release workflow (binaries on a version tag) | Written and linted; Linux leg simulated locally; **never run on GitHub** |
+| macOS and Windows builds | Build and pass the unit tests on GitHub's runners; no camera file converted there yet |
+| Release workflow (binaries on a version tag) | Working: releases 0.2.0 and 0.3.0 were built and published by it |
 | Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error, with and without an embedded original |
 | Adobe DNG Converter (extracting our originals, and ours extracting theirs) | **Never tried** |
 | Lightroom, Camera Raw | **Never tried** |
-| Git history, published releases | None yet |
+| Repository | github.com/jkobierczynski/dngconv; 0.4.0 is committed but not tagged |
 
 ## History
 
@@ -95,7 +97,7 @@ Problems found while verifying, and what was done:
 | A pinned offset beyond the end of the output would pad the file with zeros up to that point. | A pin is honoured only if it lies inside the file's natural size. |
 | LibRaw gives up with an I/O error when a maker note is the last thing in the file and parsing runs past the end. Seen with a random test note. | Follows from the previous fix: a pinned note is always inside the file, an unpinned one sits before the image data. |
 | LibRaw reports "." as a Samsung body serial. | Serials without a letter or digit are dropped. |
-| exiv2 prints a line such as `Directory Canon with 25665 entries considered invalid` for most DNGs that carry a maker note. It reads `DNGPrivateData` as a bare maker note; 25665 is the "Ad" of "Adobe". | Left as is; harmless, and the EXIF copy is read correctly. See open questions. |
+| exiv2 prints a line such as `Directory Canon with 25665 entries considered invalid` for most DNGs that carry a maker note. It reads `DNGPrivateData` as a bare maker note; 25665 is the "Ad" of "Adobe". | Left as is; harmless, and the EXIF copy is read correctly. See the questions in `TODO.md`. |
 | ExifTool misreads the private-data copy of the Samsung note. | Open. The EXIF copy of the same note decodes correctly. |
 
 ### Since 0.2.0 (2026-10-09): release workflow
@@ -197,6 +199,64 @@ error and never crash; a round trip through a real DNG in both byte orders;
 that a 5 MiB original lands behind the tiles; that a changed byte is reported
 as a digest mismatch; hostile file names; and DNGs without an original.
 
+### Since 0.4.0 (2026-10-09): on GitHub
+
+The project was published at github.com/jkobierczynski/dngconv. Both
+workflows ran as written: `ci.yml` on every push, `release.yml` for the tags
+`v0.2.0` and `v0.3.0`, each of which produced the three packages with their
+checksums. That is the first time the code was compiled and its tests run on
+macOS and Windows. `TODO.md` took over the list of open work from this file.
+
+### 0.5.0 (2026-10-09): lens corrections
+
+1. **`lens_correction.hpp`**: a maker-neutral model. Distortion, the two
+   chromatic aberration curves and the vignetting gain are each a curve over
+   the radius, in units of the picture's half diagonal.
+2. **`lens_data`**: reads the parameters of four makers into that model.
+3. **`lens_opcodes`**: fits the curves to DNG's polynomials and builds
+   `OpcodeList3`.
+4. **`--lens-corrections auto|all|none`**, and two lines in `-i` output.
+5. **New test program** (`test_lens`), described below.
+
+None of the makers documents these parameters. The reading of each was taken
+from other people's work (credited in `lens_data.cpp`: darktable's lens
+module for Sony, Fuji and Olympus; Raphael Rigo's notes for Panasonic; dcraw
+for the SR2 scrambling) and then **tested against pictures**, which changed
+several things.
+
+The test that carried most of the weight: every one of these cameras stores
+a JPEG in the raw file, and that JPEG has the camera's own correction in it.
+Points were matched between that JPEG and a render of the raw data (SIFT
+features, several thousand per file), and a model fitted that maps one onto
+the other. A render with the right correction leaves nothing but a scale and
+a shift; a wrong reading of the parameters leaves a radial pattern.
+
+| Finding | Resolution |
+|---|---|
+| All four readings of the **distortion** data hold: the residual falls from 5 to 16 pixels to under one (table in the README). For Sony, three other plausible knot spacings and "table laid out over the stored image" were tried and fit worse. | Implemented as read. |
+| **Sony and Fuji zoom the corrected picture** until it just fills the frame. The camera's table alone would cut 6 % off towards the corners of a 24 mm Sony shot; the camera's JPEG loses 3.6 %. The factor is the largest one that takes nothing from outside the frame: predicted 1.0263 and 0.9630 for the two samples, measured 1.0261 and 0.9631. | `frameFillingZoom`. With it the DNG is framed like the camera's JPEG to 0.05 %. |
+| **Olympus and Panasonic do not**: their formulas carry the scale. Panasonic leaves 4 % of the frame unused at 12 mm, as its JPEG does. | A flag per maker (`fitFrame`). |
+| **Panasonic, word 12** of the tag is not the constant 2500 the published notes took it for: it is the half diagonal of the picture in pixels (2870 for 4592 x 3448; 2500 fits the 4000 x 3000 camera the notes were made with). | Used as the radius unit, if it lies near the half diagonal. |
+| **Panasonic, the scale word.** The notes apply it to the higher terms only. Applied to the whole polynomial, the DNG matches the JPEG's scale to 0.04 % instead of 0.10 %. | Applied to the whole polynomial. The difference is a uniform zoom of a tenth of a percent. |
+| **Olympus** records "distortion correction: off" in the sample, and the camera's JPEG is corrected all the same. | The setting is ignored; the parameters are always used. |
+| **Sony vignetting is already in the raw data** when shading compensation is on. Two observations: the camera's JPEG is as bright in the corners as the raw data without any gain (within 0.1 stop, where the table says 0.73 and 0.28 stop); and in the A7 III night shot the noise variance at equal signal level rises towards the corners by 1.00, 1.00, 1.00, 1.22, 1.64, where the table's gain is 1.00, 1.03, 1.08, 1.21, 1.57. Digital gain multiplies noise; optical fall-off does not. | No vignetting opcode for Sony unless the camera's setting was off and the user asks for `all`. The first version of the code wrote it and would have brightened the corners twice. darktable 4.6 applies this table to the original file, so on these two files its result differs from ours there. |
+| **Measuring chromatic aberration on a demosaiced image under-reads it.** Blue against green at the corner of the NEX-5N: 0.5 px on the demosaiced planes, 0.9 px on the sensor's own colour planes, 1.05 px from the table. | Measured on the mosaic: every second pixel for Bayer, 3 x 3 block averages for X-Trans (in which all three colours have their centroid at the block centre). Green against the other green reads 0.0 px, as it should. |
+| **Chromatic aberration, results.** Sony NEX-5N: red and blue follow the table, including the change of sign of blue, within 0.35 px. Olympus: both within 0.1 px. Fuji: direction right for both colours, measured size about half the table's for blue. Sony A7 III: too noisy. | Implemented as read. The Fuji magnitude is an open point. |
+| The 2011 Sony file has no correction tags next to its raw image; they are in the SR2 block, which is XORed with a key stream. | Unscrambled (`unscrambleSr2`). The values equal those ExifTool prints from the same block. In the 2018 file the block repeats the plain tags, which are read first. |
+| A DNG polynomial has four terms per plane where Sony has sixteen knots. | Least squares over the radius, weighted so that the error is one of position. Worst case on the samples 0.39 px; reported per file. |
+
+What `test_lens` covers: curve interpolation; the frame-filling zoom on
+curves with a known answer; polynomial curves coming back exactly from the
+fit, also for a frame that is smaller than the image and off centre; the
+opcode list byte by byte; which corrections each mode writes; curves DNG
+cannot hold; each maker's parser on a file built by hand in the test, with
+variants (settings off, tables of the wrong length, both byte orders,
+both Fuji layouts, the SR2 block under three keys and a wrong one); 1500
+damaged copies of those files, which must neither crash nor yield a curve
+outside plausible bounds; and the opcode list arriving in a DNG. One check
+ties the test to reality: the Panasonic tag the test assembles, checksums
+included, must equal the 32 bytes of the real GF7 file.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -272,6 +332,24 @@ actually holds. The camera's JPEG is kept next to it, untouched.
 whole file; rotating the thumbnail ourselves would turn it twice in every
 reader that honours the tag.
 
+**Lens corrections follow the camera's setting by default.** A raw file
+carries the parameters even when the photographer switched the correction
+off. `auto` writes what the camera applied, so the DNG renders like the
+camera's JPEG; `all` is there for those who want everything.
+
+**Lens opcodes are flagged optional.** The raw data is complete without
+them, and a reader that does not know an opcode should skip it, not refuse
+the file. (Adobe's converter writes them as mandatory.)
+
+**Vignetting before the warp.** The makers' gain curves run over the stored
+image. `FixVignetteRadial` placed first in the list is applied there, which
+needs no conversion; placed second it would have to be re-expressed over the
+corrected radius.
+
+**The lens parsers refuse rather than guess.** Tables of an unknown length,
+checksums that do not match, values outside what a lens could need: no
+opcode. A wrong warp is worse than none.
+
 **Never overwrite, write through a temporary file.** A converter people point
 at their only copy of a photo archive should fail safe.
 
@@ -285,7 +363,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (6 programs) | CTest | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, DNG round trips through LibRaw in both byte orders |
+| Unit tests (7 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -294,7 +372,9 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Thumbnail | Pillow, reading IFD0 as a plain TIFF | A generic TIFF reader finds and shows the thumbnail; looked at next to the camera previews for all 15 files |
 | Metadata comparison | ExifTool 12.76, exiv2 0.27.6 | Each maker-note, EXIF and GPS tag has the same value in source and DNG |
 | Reversibility | `dngconv extract`, ExifTool 12.76 `-OriginalRawImage`, `cmp` | The embedded copy comes back identical to the camera file, through our reader and through an independent one |
-| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original |
+| Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
+| Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
+| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, and on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
 
 `dng_validate` is not part of this repository and is not needed to build or
@@ -305,7 +385,8 @@ SDK, libjpeg and zlib, and force-include `<cctype>`, `<cstring>`, `<cstdlib>`
 and `<cstdio>` for current compilers. `dng_validate -v file.dng` prints every
 tag it reads.
 
-The comparison scripts were throwaway Python and are not in the repository.
+The comparison scripts are Python (NumPy, SciPy, OpenCV, rawpy) and are not
+in the repository yet; bringing them in is on the list in `TODO.md`.
 The render comparison develops both files with camera white balance, linear
 demosaicing, no auto-brightness and the two LibRaw settings noted in the 0.1.0
 history, then compares the arrays. The metadata comparison runs
@@ -324,63 +405,16 @@ Not covered by any check so far:
   Adobe-made DNG with an embedded original was at hand.
 - Originals of 4 GiB or more (refused), and memory use on very large files:
   the source file and its packed copy are both held in memory.
-- macOS and Windows, including Unicode file names on Windows.
+- Lens corrections beyond the five sample files: Fuji's newer nine-knot
+  tables and its cropped modes, a Sony file with shading compensation off,
+  Fuji's vignetting gain (7 % in the sample, too small to confirm), and the
+  size of Fuji's chromatic aberration values.
+- Converting camera files on macOS and Windows (the unit tests run there),
+  including Unicode file names on Windows.
 - Four-colour sensors (CMYG, RGBE), monochrome sensors, non-square pixels,
   multi-frame files: the code paths exist and are untested on real files.
 - XMP in a source file: none of the samples has any.
 - Output above 4 GiB, which is refused by design.
-
-## Open work
-
-Suggested order:
-
-1. **Open the files in Lightroom or Camera Raw.** The reference validator
-   accepts them; what remains to be seen is colour and lens-profile matching
-   in the real applications.
-2. **Put the project on GitHub and run both workflows.** `ci.yml` and
-   `release.yml` exist and have never executed there. Start `release.yml` by
-   hand first ("Run workflow"), which builds the packages without publishing
-   anything, and tag only once that is green.
-3. **Try an Adobe-made DNG with an embedded original** in `dngconv extract`,
-   and one of ours in Adobe's DNG Converter ("Extract originals"). Closes the
-   last gap in the 0.4.0 verification.
-4. **Maker data outside the maker note.** Sony `SR2Private`, which Adobe
-   stores as its own block in `DNGPrivateData`; the Canon CR3 timed-metadata
-   track.
-5. **Lens corrections as opcodes** (`WarpRectilinear`, `FixVignetteRadial`)
-   for the mirrorless makers that store them in maker notes. Large: needs
-   per-maker parsing.
-6. **Bring the comparison scripts into the repository** as a `tools/` folder,
-   with a recipe for building `dng_validate`, so the checks above can be
-   repeated by anyone with sample files.
-7. Smaller items: parallel conversion of several files, keeping file
-   timestamps (also for extracted originals), embedding a camera's `.THM`
-   sidecar with the original (forks 5 to 8 of the layout exist for that),
-   streaming the original instead of holding it in memory, picking up XMP
-   sidecars, a `--byte-order` switch, detecting an
-   input that already is a DNG before decoding it, a JPEG preview for files
-   that carry none.
-8. Further out: JPEG XL compression (DNG 1.7), Fuji Super CCD, floating-point
-   raws, a second calibration illuminant, a library interface.
-
-## Open questions
-
-- **Is the private-data copy of the maker note needed?** Adobe's SDK reads
-  both copies (see the 0.3.0 history), so either would do for Adobe software.
-  Dropping the private-data copy would silence the exiv2 message and save
-  space; keeping it protects the note when a program rewrites the DNG. Kept
-  for now.
-- **Samsung maker note in `DNGPrivateData`.** ExifTool decodes it wrongly.
-  Either the original-offset convention differs for notes whose pointers are
-  relative to the note itself, or it is a limitation in ExifTool. A DNG made
-  by Adobe's converter from a Samsung file would tell.
-- **`MakerNoteSafety`.** Not written, which means "unsafe to preserve". That
-  is the cautious answer for notes with absolute pointers, but it tells a
-  rewriting program to drop the EXIF copy.
-- **White level policy.** The camera-reported level is used when lower than
-  the format maximum. Whether that matches what users expect in practice needs
-  more files with blown highlights.
-- **Name.** `dngconv` is a working name.
 
 ## Working on the code
 
@@ -463,14 +497,10 @@ Choices made in the workflow, and what to revisit:
 - Unsigned macOS and Windows binaries trigger the usual first-run warnings
   (Gatekeeper, SmartScreen).
 
-What has and has not been tried: the workflow passes `actionlint` and
-`shellcheck`; the version check was run against matching and non-matching
-tags; the Linux build flags and the packaging step were run locally against a
-statically built LibRaw 0.22.0. The vcpkg steps, the macOS and Windows legs
-and everything involving the GitHub release itself have **not** been run. The
-vcpkg port was read to confirm the CMake targets (`libraw::raw_r`) and that it
-handles static linking on Windows, but the first real run may still need
-adjustments.
+What has and has not been tried: the workflow built and published releases
+0.2.0 and 0.3.0 without changes. Since then zlib joined the dependencies
+(0.4.0, added to the vcpkg step); that version of the release workflow has
+not run yet, because 0.4.0 was never tagged.
 
 Conventions used so far:
 

@@ -17,6 +17,9 @@ struct RawReadOptions {
     bool loadPreview = true;
     /// Collect the source's EXIF and GPS directories and its maker note.
     bool copyMetadata = true;
+    /// Look for the camera's lens-correction parameters (distortion,
+    /// chromatic aberration, vignetting).
+    bool readLensData = true;
     /// Keep a copy of the whole source file in RawImage::originalFile, for
     /// embedding in the DNG.
     bool keepOriginalFile = false;

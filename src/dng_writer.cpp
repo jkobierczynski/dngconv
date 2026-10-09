@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "lens_opcodes.hpp"
 #include "ljpeg92.hpp"
 #include "md5.hpp"
 #include "original_raw.hpp"
@@ -79,6 +80,7 @@ constexpr uint16_t DNGPrivateData = 50740;
 constexpr uint16_t RawDataUniqueID = 50781;
 constexpr uint16_t ActiveArea = 50829;
 constexpr uint16_t OpcodeList1 = 51008;
+constexpr uint16_t OpcodeList3 = 51022;
 constexpr uint16_t NewRawImageDigest = 51111;
 // EXIF IFD
 constexpr uint16_t ExposureTime = 33434;
@@ -515,8 +517,12 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         const int phase = bayerPhase(img);
         if (phase >= 0) opcodeList1 = fixBadPixelsConstantOpcode(0, static_cast<uint32_t>(phase));
     }
-    const bool hasOpcodes = !opcodeList1.empty();
-    if (hasOpcodes) raw.setUndefined(tag::OpcodeList1, opcodeList1);
+    if (!opcodeList1.empty()) raw.setUndefined(tag::OpcodeList1, opcodeList1);
+
+    // The camera's lens corrections, for the reader to apply after demosaicing.
+    const std::vector<uint8_t> opcodeList3 = makeLensOpcodes(img, options.lensCorrections).opcodeList3;
+    if (!opcodeList3.empty()) raw.setUndefined(tag::OpcodeList3, opcodeList3);
+    const bool hasOpcodes = !opcodeList1.empty() || !opcodeList3.empty();
 
     // ---- thumbnail --------------------------------------------------------------
     if (withThumbnail) {
@@ -563,8 +569,11 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (options.digests) {
         const Md5Digest imageDigest = newRawImageDigest(img, options.threads);
         ifd0.setBytes(tag::NewRawImageDigest, digestBytes(imageDigest));
+        // Every opcode list counts: they change how the data is rendered.
+        std::vector<uint8_t> opcodes = opcodeList1;
+        opcodes.insert(opcodes.end(), opcodeList3.begin(), opcodeList3.end());
         ifd0.setBytes(tag::RawDataUniqueID,
-                      digestBytes(rawDataUniqueId(img, imageDigest, opcodeList1)));
+                      digestBytes(rawDataUniqueId(img, imageDigest, opcodes)));
     }
 
     // ---- the original file ---------------------------------------------------------

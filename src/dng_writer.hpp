@@ -9,6 +9,7 @@
 #include <iosfwd>
 #include <string>
 
+#include "lens_opcodes.hpp"
 #include "raw_image.hpp"
 
 namespace dngconv {
@@ -48,6 +49,9 @@ struct DngWriteOptions {
     /// Carry over the camera maker's private metadata block. The rest of the
     /// copied metadata (EXIF, GPS) is written whenever the RawImage has it.
     bool makerNotes = true;
+    /// Which of the camera's lens corrections (RawImage::lens) to pass on to
+    /// the reader as opcodes.
+    LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
     DngByteOrder byteOrder = DngByteOrder::MatchSource;
     /// Value of the TIFF Software tag.
     std::string software = "dngconv";

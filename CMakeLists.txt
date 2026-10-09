@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.4.0 LANGUAGES CXX
+project(dngconv VERSION 0.5.0 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -90,6 +90,8 @@ configure_file(src/version.hpp.in generated/version.hpp @ONLY)
 
 add_library(dngconv_core STATIC
   src/dng_writer.cpp
+  src/lens_data.cpp
+  src/lens_opcodes.cpp
   src/ljpeg92.cpp
   src/md5.cpp
   src/original_raw.cpp
@@ -137,6 +139,10 @@ if(DNGCONV_BUILD_TESTS)
   add_executable(test_original tests/test_original.cpp)
   target_link_libraries(test_original PRIVATE dngconv_core dngconv_warnings)
   add_test(NAME original COMMAND test_original ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(test_lens tests/test_lens.cpp)
+  target_link_libraries(test_lens PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME lens COMMAND test_lens ${CMAKE_CURRENT_BINARY_DIR})
 
   add_executable(test_roundtrip tests/test_roundtrip.cpp)
   target_link_libraries(test_roundtrip PRIVATE dngconv_core dngconv_warnings)

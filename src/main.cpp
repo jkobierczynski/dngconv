@@ -39,6 +39,7 @@ struct Settings {
     bool preview = true;
     bool makerNotes = true;
     bool embedOriginal = false;
+    LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
     bool recursive = false;
     bool force = false;
     bool verify = false;
@@ -69,6 +70,10 @@ const char* const kUsage =
     "      --no-maker-notes      do not copy the camera maker's private metadata\n"
     "  -e, --embed-original      store the source file inside the DNG, so that\n"
     "                            'dngconv extract' can restore it later\n"
+    "      --lens-corrections <which>\n"
+    "                            pass the camera's lens corrections on to the\n"
+    "                            DNG reader: auto (default; those the camera was\n"
+    "                            set to apply), all, or none\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -f, --force               overwrite existing DNG files\n"
     "      --verify              re-read each DNG and compare it with the source\n"
@@ -193,6 +198,22 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
             s.makerNotes = false;
         } else if (a == "-e" || a == "--embed-original") {
             s.embedOriginal = true;
+        } else if (a == "--lens-corrections") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            if (*v == "auto") {
+                s.lensCorrections = LensCorrectionMode::Auto;
+            } else if (*v == "all") {
+                s.lensCorrections = LensCorrectionMode::All;
+            } else if (*v == "none") {
+                s.lensCorrections = LensCorrectionMode::None;
+            } else {
+                std::fprintf(stderr,
+                             "dngconv: unknown choice '%s' for --lens-corrections "
+                             "(use auto, all or none)\n",
+                             v->c_str());
+                return false;
+            }
         } else if (a == "-r" || a == "--recursive") {
             s.recursive = true;
         } else if (a == "-f" || a == "--force") {
@@ -259,7 +280,23 @@ const char* colourName(uint8_t code) {
     return code < 7 ? names[code] : "?";
 }
 
-void printInfo(const fs::path& path, const RawReadResult& r) {
+// How closely the DNG polynomials follow the camera's curves.
+std::string fitQuality(const LensOpcodes& lens) {
+    char buffer[96];
+    std::string out;
+    if (lens.planes) {
+        std::snprintf(buffer, sizeof buffer, "geometry within %.2f px", lens.warpErrorPixels);
+        out = buffer;
+    }
+    if (lens.vignetting) {
+        std::snprintf(buffer, sizeof buffer, "%sbrightness within %.1f %%", out.empty() ? "" : ", ",
+                      lens.gainErrorPercent);
+        out += buffer;
+    }
+    return out;
+}
+
+void printInfo(const fs::path& path, const RawReadResult& r, LensCorrectionMode lensMode) {
     const RawImage& img = r.image;
     std::printf("%s\n", show(path).c_str());
     std::printf("  camera        %s\n", img.uniqueCameraModel.c_str());
@@ -313,6 +350,30 @@ void printInfo(const fs::path& path, const RawReadResult& r) {
         std::printf("\n");
     } else {
         std::printf("  metadata      nothing to copy (format not understood or no EXIF)\n");
+    }
+    if (!img.lens.empty()) {
+        const LensCorrection& lens = img.lens;
+        std::string found;
+        const auto add = [&](bool has, bool enabled, bool inData, const char* name) {
+            if (!has) return;
+            if (!found.empty()) found += ", ";
+            found += name;
+            if (inData)
+                found += " (already applied to the raw data by the camera)";
+            else if (!enabled)
+                found += " (off in the camera)";
+        };
+        add(lens.hasDistortion(), lens.distortionEnabled, false, "distortion");
+        add(lens.hasCa(), lens.caEnabled, false, "chromatic aberration");
+        add(lens.hasVignetting(), lens.vignettingEnabled, lens.vignettingInData, "vignetting");
+        std::printf("  lens data     %s: %s\n", lens.origin.c_str(), found.c_str());
+        const LensOpcodes opcodes = makeLensOpcodes(img, lensMode);
+        if (opcodes.any())
+            std::printf("  corrections   %s (%s)\n", opcodes.summary().c_str(),
+                        fitQuality(opcodes).c_str());
+        else
+            std::printf("  corrections   none would be written\n");
+        for (const auto& note : opcodes.notes) std::printf("  note          %s\n", note.c_str());
     }
     if (r.sourceIsDng) {
         std::printf("  note          this file already is a DNG\n");
@@ -545,7 +606,7 @@ int main(int argc, char** argv) {
                 RawReadOptions ro;
                 ro.metadataOnly = true;
                 ro.loadPreview = false;
-                printInfo(job.input, readRaw(job.input, ro));
+                printInfo(job.input, readRaw(job.input, ro), settings.lensCorrections);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "dngconv: %s: %s\n", show(job.input).c_str(), e.what());
                 ++failures;
@@ -565,6 +626,7 @@ int main(int argc, char** argv) {
     writeOptions.threads = settings.threads;
     writeOptions.embedPreview = settings.preview;
     writeOptions.makerNotes = settings.makerNotes;
+    writeOptions.lensCorrections = settings.lensCorrections;
     writeOptions.software = std::string("dngconv ") + kVersion;
 
     int converted = 0, failed = allFound ? 0 : 1;
@@ -606,6 +668,8 @@ int main(int argc, char** argv) {
             }
             writeDng(source.image, target, writeOptions);
             if (settings.verify) verifyOutput(source.image, target);
+            const LensOpcodes lens = makeLensOpcodes(source.image, settings.lensCorrections);
+            for (const auto& note : lens.notes) source.warnings.push_back(note);
 
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -614,9 +678,10 @@ int main(int argc, char** argv) {
             if (!settings.quiet) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
-                std::printf("%s -> %s  (%s, %s -> %s, %.1f s%s)\n", name.c_str(),
+                std::printf("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s)\n", name.c_str(),
                             show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                             megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
+                            lens.any() ? ", lens: " : "", lens.summary().c_str(),
                             settings.verify ? (settings.embedOriginal
                                                    ? ", pixels and embedded original verified"
                                                    : ", verified")

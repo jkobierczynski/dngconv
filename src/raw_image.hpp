@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "lens_correction.hpp"
+
 namespace dngconv {
 
 /// Colour codes used by the TIFF/EP CFAPattern and DNG CFAPlaneColor tags.
@@ -119,6 +121,11 @@ struct RawImage {
     // few others do). The samples are kept as they are; the DNG gets an
     // instruction telling readers to interpolate over them.
     bool zeroIsBadPixel = false;
+
+    // ---- lens corrections ----------------------------------------------------
+    // What the camera recorded about straightening and evening out the
+    // picture, if anything; see lens_correction.hpp.
+    LensCorrection lens;
 
     // ---- colour -------------------------------------------------------------
     // XYZ (D65) -> camera native, colorPlanes rows of 3.

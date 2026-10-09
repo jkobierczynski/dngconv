@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.4.0, early**. It works on the cameras listed under
+Status: **0.5.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -23,6 +23,10 @@ Status: **0.4.0, early**. It works on the cameras listed under
 - Metadata: the camera's complete EXIF and GPS directories and its maker
   note are carried over, read directly from the source file. Maker and model
   keep the camera's own spelling.
+- Lens corrections: the distortion, chromatic aberration and vignetting
+  parameters that Sony, Fujifilm, Panasonic and Olympus cameras record are
+  turned into DNG opcodes, so a DNG reader straightens the picture the way
+  the camera's own JPEG is. See [Lens corrections](#lens-corrections).
 - Previews in the standard DNG arrangement: a small thumbnail rendered from
   the raw data in the first image directory, where file browsers look, and
   the camera's own full-size JPEG as a second preview.
@@ -36,7 +40,8 @@ Status: **0.4.0, early**. It works on the cameras listed under
 
 ## Download
 
-Tagged releases on GitHub carry ready-made binaries for Linux (x86_64), macOS
+[Tagged releases on GitHub](https://github.com/jkobierczynski/dngconv/releases)
+carry ready-made binaries for Linux (x86_64), macOS
 (Apple Silicon) and Windows (x64). They are self-contained: LibRaw and zlib
 are linked in. Unpack the archive and run `dngconv` from a terminal.
 
@@ -79,6 +84,7 @@ dngconv -o out/ *.NEF                 # into a folder
 dngconv -r -o ~/dng ~/photos/2026     # a whole tree, keeping its structure
 dngconv --verify -o safe.dng shot.ARW # convert, then prove nothing was lost
 dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
+dngconv --lens-corrections none *.ARW # leave the lens corrections out
 dngconv -i shot.RAF                   # show what the decoder finds
 ```
 
@@ -89,6 +95,10 @@ dngconv -i shot.RAF                   # show what the decoder finds
       --no-maker-notes      do not copy the camera maker's private metadata
   -e, --embed-original      store the source file inside the DNG, so that
                             'dngconv extract' can restore it later
+      --lens-corrections <which>
+                            pass the camera's lens corrections on to the
+                            DNG reader: auto (default; those the camera was
+                            set to apply), all, or none
   -r, --recursive           descend into sub-folders
   -f, --force               overwrite existing DNG files
       --verify              re-read each DNG and compare it with the source
@@ -141,7 +151,7 @@ is written to read originals embedded by other converters.
 
 ## What has been tested
 
-Each file below was converted and then checked six ways:
+Each file below was converted and then checked in up to seven ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -163,6 +173,11 @@ Each file below was converted and then checked six ways:
    twice, with `dngconv extract` and with ExifTool. Both results are
    identical to the camera file for every sample, and the larger DNGs pass
    checks 1, 3 and 5 as well.
+
+7. **Lens corrections** (the five files that carry them): the DNG was
+   developed by Adobe's code and by darktable, with the opcodes applied, and
+   the result laid over the JPEG the camera itself made of the same shot. See
+   [Lens corrections](#lens-corrections) for the numbers.
 
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
@@ -191,9 +206,10 @@ large: the Olympus one is 1.4 MB because it contains a preview image.
 Checked with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18 on Linux, and under
 AddressSanitizer and UndefinedBehaviorSanitizer, including extraction from
 DNGs that were truncated or overwritten with random bytes. The macOS and
-Windows builds in the CI workflow have not been run yet. Adobe's validator is
-the reference reader, but the files have not been opened in Lightroom or
-Camera Raw themselves. Two things about embedded originals are untested for
+Windows builds are compiled and run through the unit tests by the GitHub
+workflows; no camera file has been converted on those systems. Adobe's
+validator is the reference reader, but the files have not been opened in
+Lightroom or Camera Raw themselves. Two things about embedded originals are untested for
 lack of the software: extracting a dngconv-embedded file with Adobe's DNG
 Converter, and extracting an original embedded by Adobe's converter with
 `dngconv extract`.
@@ -287,6 +303,92 @@ Two things readers do with the private-data copy:
 Maker notes hold serial numbers, shutter counts and sometimes owner names;
 keep that in mind before sharing files.
 
+## Lens corrections
+
+Many mirrorless lenses are designed to be corrected in software: the camera
+straightens its JPEGs and records, in every raw file, the numbers it used.
+dngconv reads those numbers and writes them as DNG opcodes (`WarpRectilinear`
+and `FixVignetteRadial` in `OpcodeList3`). The raw data is not touched; a
+reader that honours the opcodes applies them after demosaicing.
+
+| Maker | Where the camera keeps the parameters | Distortion | Chromatic aberration | Vignetting |
+|---|---|---|---|---|
+| Sony (ARW) | tags next to the raw image; in bodies before 2012, the scrambled SR2 block | yes | yes | already applied by the camera, see below |
+| Fujifilm (RAF, X-Trans) | a directory in front of the raw data | yes | yes | yes |
+| Panasonic (RW2) | the `DistortionInfo` tag | yes | no | no |
+| Olympus (ORF) | the maker note | yes | yes | no |
+
+Files of other makers (Canon, Nikon, Pentax, Samsung and the rest) are
+converted as before, without lens opcodes.
+
+`--lens-corrections` chooses what is written:
+
+- `auto` (the default): the corrections the camera itself was set to apply,
+  so the DNG renders like the camera's JPEG. A Sony body with distortion
+  compensation switched off gets no distortion opcode.
+- `all`: every correction the file has parameters for.
+- `none`: no lens opcodes.
+
+`dngconv -i` shows what a file holds and what would be written:
+
+```
+  lens data     Sony: distortion (off in the camera), chromatic aberration, vignetting (already applied to the raw data by the camera)
+  corrections   chromatic aberration (geometry within 0.02 px)
+```
+
+**How good is it.** For each of the five sample files that carry parameters,
+the DNG was developed with the opcodes applied, once by Adobe's DNG SDK and
+once by darktable 4.6, and matched point by point against the JPEG the
+camera stored in the same file. The table gives the median distance between
+matched points, in pixels of the full-size picture; without the opcodes it
+is what the lens's distortion makes it.
+
+| Camera, lens | Without opcodes | With opcodes, Adobe SDK | With opcodes, darktable |
+|---|---:|---:|---:|
+| Sony A7 III, FE 24-105mm F4 at 24 mm | 9.3 px | 0.9 px | 0.8 px |
+| Sony NEX-5N, E 24mm F1.8 (distortion off in the camera) | 0.3 px | 0.3 px | 0.4 px |
+| Fujifilm X-E1, XF 18-55mm | 6.2 px | 0.9 px | 0.9 px |
+| Panasonic GF7, 12-32mm at 12 mm | 15.8 px | 0.6 px | 0.7 px |
+| Olympus E-M10, 14-42mm EZ at 42 mm | 5.2 px | 0.4 px | 0.4 px |
+
+The remaining half pixel to one pixel is the accuracy of the comparison (the
+camera JPEGs are previews of 1616 to 3200 pixels width). The picture is also
+framed like the camera's: the scale agrees to 0.05 % or better.
+
+What the figures do not cover:
+
+- **Chromatic aberration** was checked on the sensor data itself. The colour
+  fringes measured there match the camera's parameters in direction and size
+  for the Olympus (within 0.1 px) and the Sony NEX-5N (within 0.35 px, at
+  the corners). For the Fuji the direction matches and the measured size is
+  smaller than the table says; for the Sony A7 III (a night shot) the
+  measurement is too noisy to tell.
+- **Fuji vignetting** is written as the table gives it. In the sample it is
+  7 % at the corners, too little to confirm against the JPEG.
+- The newer Fuji table layout (nine knots, X-Trans IV and later) and Fuji's
+  cropped shooting modes are implemented from the description in darktable's
+  source and have not seen a real file here.
+
+**Sony and vignetting.** When "shading compensation" is on, a Sony camera
+multiplies the raw data itself with the gain before storing it; the table in
+the file then only records what was done. Applying it again would brighten
+the corners twice, so dngconv does not write it. (In the A7 III sample the
+noise in the corners is higher by exactly the table's factor, and in both
+Sony samples the camera's JPEG is as bright in the corners as the raw data
+without any further gain.) With shading compensation off, the table is only
+used with `--lens-corrections all`.
+
+**Which readers apply them.** Adobe's DNG SDK, on which Lightroom and Camera
+Raw are built, applies opcodes whenever it renders a file. darktable (tried
+with 4.6) offers them in its lens correction module under "embedded
+metadata". Programs built on LibRaw, and RawTherapee 5.10, ignore them and
+show the picture uncorrected, as they would the original raw file. The
+thumbnail in the DNG is rendered without the corrections.
+
+**Accuracy of the conversion.** The cameras use tables and formulas of their
+own; DNG wants polynomials. The fit is reported for every file (`-i`, see
+above) and stayed below 0.4 pixels and 0.5 % brightness on the samples.
+
 ## Things worth knowing
 
 **Defect pixels.** Panasonic cameras (and a few others) mark dead pixels by
@@ -341,8 +443,10 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 
 ## Not there yet
 
-- Maker-specific data outside the maker note (see [Metadata](#metadata)), and
-  turning the lens corrections found in maker notes into DNG opcodes.
+- Maker-specific data outside the maker note (see [Metadata](#metadata)).
+- Lens corrections for makers other than the four listed under
+  [Lens corrections](#lens-corrections), and vignetting for Panasonic and
+  Olympus.
 - Fuji Super CCD sensors with the diagonal layout, floating-point raws, and
   multi-frame files beyond their first frame (pixel shift, dual exposure).
 - Sigma X3F works only if your LibRaw was built with X3F support; most
@@ -362,18 +466,22 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 | `src/tiff_source.*` | Bounds-checked TIFF reading for files that are not trusted, shared by the metadata reader and `extract` |
 | `src/original_raw.*` | Packs the source file for `OriginalRawFileData`, unpacks it, and finds it in a DNG |
 | `src/dng_writer.*` | `RawImage` to DNG |
+| `src/lens_correction.hpp` | Lens corrections as curves over the radius, independent of the maker |
+| `src/lens_data.*` | Reads each maker's lens-correction parameters into those curves |
+| `src/lens_opcodes.*` | Fits the curves to DNG's polynomials and builds the opcode list |
 | `src/thumbnail.*` | Renders the small RGB thumbnail from the raw data |
 | `src/ljpeg92.*` | Lossless JPEG encoder |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/parallel.hpp` | Runs a job list on all cores |
 | `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset |
 | `src/main.cpp` | Command line: conversion and `extract` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.
 
-Development history, design decisions and open work are in `DEVELOPMENT.md`.
+Development history and design decisions are in `DEVELOPMENT.md`, open work
+in `TODO.md`.
 
 ## Licence
 
