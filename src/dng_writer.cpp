@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "ljpeg92.hpp"
+#include "md5.hpp"
+#include "thumbnail.hpp"
 #include "tiff_writer.hpp"
 
 namespace dngconv {
@@ -70,8 +72,10 @@ constexpr uint16_t LensInfo = 50736;
 constexpr uint16_t CalibrationIlluminant1 = 50778;
 constexpr uint16_t OriginalRawFileName = 50827;
 constexpr uint16_t DNGPrivateData = 50740;
+constexpr uint16_t RawDataUniqueID = 50781;
 constexpr uint16_t ActiveArea = 50829;
 constexpr uint16_t OpcodeList1 = 51008;
+constexpr uint16_t NewRawImageDigest = 51111;
 // EXIF IFD
 constexpr uint16_t ExposureTime = 33434;
 constexpr uint16_t FNumber = 33437;
@@ -100,6 +104,7 @@ constexpr uint16_t GPSAltitude = 6;
 
 constexpr uint16_t kCompressionNone = 1;
 constexpr uint16_t kCompressionJpeg = 7;  // lossless JPEG for raw data, DCT JPEG for previews
+constexpr uint16_t kPhotometricRgb = 2;
 constexpr uint16_t kPhotometricYCbCr = 6;
 constexpr uint16_t kPhotometricCfa = 32803;
 constexpr uint16_t kPhotometricLinearRaw = 34892;
@@ -339,6 +344,66 @@ void copyFields(const std::vector<TiffField>& fields, TiffIfd& ifd, bool overwri
     }
 }
 
+// NewRawImageDigest: a fingerprint of the stored raw samples that a reader can
+// recompute to detect damage. The DNG specification defers to Adobe's SDK for
+// the definition, which is: cut the frame into tiles of 256 x 256 pixels
+// (smaller at the right and bottom edges, and never larger than the frame);
+// take the MD5 of each tile's samples as little-endian 16-bit values, one
+// colour plane after the other; then take the MD5 of all tile digests in
+// row-major order.
+Md5Digest newRawImageDigest(const RawImage& img, unsigned threads) {
+    const uint32_t spp = img.samplesPerPixel;
+    const uint32_t tileW = std::min<uint32_t>(256, img.width);
+    const uint32_t tileH = std::min<uint32_t>(256, img.height);
+    const uint32_t across = (img.width + tileW - 1) / tileW;
+    const uint32_t down = (img.height + tileH - 1) / tileH;
+    std::vector<Md5Digest> tileDigests(static_cast<size_t>(across) * down);
+
+    parallelFor(tileDigests.size(), threads, [&](size_t index) {
+        const uint32_t left = static_cast<uint32_t>(index % across) * tileW;
+        const uint32_t top = static_cast<uint32_t>(index / across) * tileH;
+        const uint32_t w = std::min(tileW, img.width - left);
+        const uint32_t h = std::min(tileH, img.height - top);
+        std::vector<uint8_t> bytes(static_cast<size_t>(w) * h * spp * 2);
+        size_t at = 0;
+        for (uint32_t plane = 0; plane < spp; ++plane)
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint16_t* row =
+                    &img.pixels[(static_cast<size_t>(top + y) * img.width + left) * spp + plane];
+                for (uint32_t x = 0; x < w; ++x) {
+                    const uint16_t v = row[static_cast<size_t>(x) * spp];
+                    bytes[at++] = static_cast<uint8_t>(v & 0xff);
+                    bytes[at++] = static_cast<uint8_t>(v >> 8);
+                }
+            }
+        tileDigests[index] = Md5::of(bytes.data(), bytes.size());
+    });
+
+    Md5 all;
+    for (const Md5Digest& d : tileDigests) all.update(d.data(), d.size());
+    return all.finish();
+}
+
+// RawDataUniqueID: the same for every DNG made from the same exposure, and
+// different otherwise. Built from the image digest plus the things that
+// change how the data is to be read: camera model, default crop, opcodes.
+Md5Digest rawDataUniqueId(const RawImage& img, const Md5Digest& imageDigest,
+                          const std::vector<uint8_t>& opcodes) {
+    Md5 md5;
+    md5.update(imageDigest.data(), imageDigest.size());
+    md5.update(img.uniqueCameraModel.data(), img.uniqueCameraModel.size());
+    for (uint32_t v : {img.activeTop, img.activeLeft, img.cropLeft, img.cropTop, img.cropWidth,
+                       img.cropHeight}) {
+        const uint8_t le[4] = {static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8),
+                               static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24)};
+        md5.update(le, 4);
+    }
+    md5.update(opcodes.data(), opcodes.size());
+    return md5.finish();
+}
+
+std::vector<uint8_t> digestBytes(const Md5Digest& d) { return {d.begin(), d.end()}; }
+
 bool allIntegers(const std::vector<double>& v) {
     return std::all_of(v.begin(), v.end(), [](double x) {
         return x >= 0 && x <= 4294967295.0 && std::floor(x) == x;
@@ -401,10 +466,18 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     JpegInfo preview;
     const bool withPreview =
         options.embedPreview && !img.previewJpeg.empty() && parseJpeg(img.previewJpeg, preview);
+    RgbImage thumbnail;
+    if (options.embedThumbnail) thumbnail = renderThumbnail(img);
+    const bool withThumbnail = !thumbnail.pixels.empty();
 
-    // With a preview, IFD0 describes the preview and the raw image lives in a
-    // sub-IFD; without one the raw image is IFD0 itself.
-    TiffIfd& raw = withPreview ? tiff.addIfd() : ifd0;
+    // The layout Adobe's converter uses and file browsers expect:
+    //   IFD0       small uncompressed thumbnail, plus all camera metadata
+    //   SubIFD 0   the raw image
+    //   SubIFD 1   the camera's full-size JPEG preview
+    // Without a thumbnail the JPEG preview takes IFD0; with neither, the raw
+    // image is IFD0 itself.
+    TiffIfd& raw = (withThumbnail || withPreview) ? tiff.addIfd() : ifd0;
+    TiffIfd& previewIfd = (withThumbnail && withPreview) ? tiff.addIfd() : ifd0;
 
     // ---- raw image ----------------------------------------------------------
     const uint32_t spp = img.samplesPerPixel;
@@ -471,35 +544,61 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     raw.setLongs(tag::ActiveArea,
                  {img.activeTop, img.activeLeft, img.activeBottom, img.activeRight});
 
-    bool hasOpcodes = false;
+    std::vector<uint8_t> opcodeList1;
     if (img.zeroIsBadPixel) {
         const int phase = bayerPhase(img);
-        if (phase >= 0) {
-            raw.setUndefined(tag::OpcodeList1,
-                             fixBadPixelsConstantOpcode(0, static_cast<uint32_t>(phase)));
-            hasOpcodes = true;
-        }
+        if (phase >= 0) opcodeList1 = fixBadPixelsConstantOpcode(0, static_cast<uint32_t>(phase));
+    }
+    const bool hasOpcodes = !opcodeList1.empty();
+    if (hasOpcodes) raw.setUndefined(tag::OpcodeList1, opcodeList1);
+
+    // ---- thumbnail --------------------------------------------------------------
+    if (withThumbnail) {
+        ifd0.setLong(tag::NewSubFileType, 1);  // reduced-resolution image
+        ifd0.setLong(tag::ImageWidth, thumbnail.width);
+        ifd0.setLong(tag::ImageLength, thumbnail.height);
+        ifd0.setShorts(tag::BitsPerSample, {8, 8, 8});
+        ifd0.setShort(tag::Compression, kCompressionNone);
+        ifd0.setShort(tag::PhotometricInterpretation, kPhotometricRgb);
+        ifd0.setShort(tag::SamplesPerPixel, 3);
+        ifd0.setLong(tag::RowsPerStrip, thumbnail.height);
+        ifd0.setShort(tag::PlanarConfiguration, 1);
+        std::vector<std::vector<uint8_t>> strip;
+        strip.push_back(std::move(thumbnail.pixels));
+        ifd0.setChunks(tag::StripOffsets, tag::StripByteCounts, std::move(strip));
     }
 
-    // ---- preview --------------------------------------------------------------
+    // ---- JPEG preview -------------------------------------------------------------
     if (withPreview) {
-        ifd0.setLong(tag::NewSubFileType, 1);  // reduced-resolution image
-        ifd0.setLong(tag::ImageWidth, preview.width);
-        ifd0.setLong(tag::ImageLength, preview.height);
-        ifd0.setShorts(tag::BitsPerSample, {8, 8, 8});
-        ifd0.setShort(tag::Compression, kCompressionJpeg);
-        ifd0.setShort(tag::PhotometricInterpretation, kPhotometricYCbCr);
-        ifd0.setShort(tag::SamplesPerPixel, 3);
-        ifd0.setLong(tag::RowsPerStrip, preview.height);
-        ifd0.setShort(tag::PlanarConfiguration, 1);
-        ifd0.setShorts(tag::YCbCrSubSampling, {static_cast<uint16_t>(preview.subH),
-                                               static_cast<uint16_t>(preview.subV)});
-        ifd0.setShort(tag::YCbCrPositioning, 1);
-        ifd0.setRationals(tag::ReferenceBlackWhite, {0, 255, 128, 255, 128, 255});
+        previewIfd.setLong(tag::NewSubFileType, 1);  // reduced-resolution image
+        previewIfd.setLong(tag::ImageWidth, preview.width);
+        previewIfd.setLong(tag::ImageLength, preview.height);
+        previewIfd.setShorts(tag::BitsPerSample, {8, 8, 8});
+        previewIfd.setShort(tag::Compression, kCompressionJpeg);
+        previewIfd.setShort(tag::PhotometricInterpretation, kPhotometricYCbCr);
+        previewIfd.setShort(tag::SamplesPerPixel, 3);
+        previewIfd.setLong(tag::RowsPerStrip, preview.height);
+        previewIfd.setShort(tag::PlanarConfiguration, 1);
+        previewIfd.setShorts(tag::YCbCrSubSampling, {static_cast<uint16_t>(preview.subH),
+                                                     static_cast<uint16_t>(preview.subV)});
+        previewIfd.setShort(tag::YCbCrPositioning, 1);
+        previewIfd.setRationals(tag::ReferenceBlackWhite, {0, 255, 128, 255, 128, 255});
         std::vector<std::vector<uint8_t>> strip;
         strip.push_back(img.previewJpeg);
-        ifd0.setChunks(tag::StripOffsets, tag::StripByteCounts, std::move(strip));
+        previewIfd.setChunks(tag::StripOffsets, tag::StripByteCounts, std::move(strip));
+    }
+
+    if (withThumbnail && withPreview)
+        ifd0.setSubIfds(tag::SubIFDs, {&raw, &previewIfd});
+    else if (withThumbnail || withPreview)
         ifd0.setSubIfds(tag::SubIFDs, {&raw});
+
+    // ---- fingerprints -------------------------------------------------------------
+    if (options.digests) {
+        const Md5Digest imageDigest = newRawImageDigest(img, options.threads);
+        ifd0.setBytes(tag::NewRawImageDigest, digestBytes(imageDigest));
+        ifd0.setBytes(tag::RawDataUniqueID,
+                      digestBytes(rawDataUniqueId(img, imageDigest, opcodeList1)));
     }
 
     // ---- camera and picture description (always in IFD0) ------------------------

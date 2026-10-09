@@ -224,6 +224,16 @@ void copyExif(const Tiff& tiff, const std::vector<Entry>& entries, SourceMetadat
         },
         meta.exif);
 
+    // LensSpecification: cameras write 0/1 for an aperture they do not know,
+    // where the EXIF standard asks for 0/0. Same meaning, valid form.
+    for (TiffField& f : meta.exif) {
+        if (f.tag != 42034 || f.type != 5) continue;
+        for (size_t i = 0; i + 8 <= f.data.size(); i += 8) {
+            const bool zeroNumerator = !(f.data[i] | f.data[i + 1] | f.data[i + 2] | f.data[i + 3]);
+            if (zeroNumerator) std::fill(f.data.begin() + i + 4, f.data.begin() + i + 8, uint8_t{0});
+        }
+    }
+
     if (const Entry* e = find(entries, kMakerNote)) {
         std::vector<uint8_t> note;
         uint32_t offset = 0;

@@ -383,6 +383,25 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
         }
     }
 
+    // Keep a margin between the default crop and the edge of the active area.
+    // Interpolating a mosaic needs neighbours on every side, and DNG readers
+    // complain about less than two pixels. Two keeps the Bayer phase.
+    if (img.isCfa) {
+        const uint32_t pad = 2;
+        if (activeW > 16 * pad && activeH > 16 * pad) {
+            const uint32_t left = std::max(img.cropLeft, pad);
+            const uint32_t top = std::max(img.cropTop, pad);
+            const uint32_t right = std::min(img.cropLeft + img.cropWidth, activeW - pad);
+            const uint32_t bottom = std::min(img.cropTop + img.cropHeight, activeH - pad);
+            if (right > left && bottom > top) {
+                img.cropLeft = left;
+                img.cropTop = top;
+                img.cropWidth = right - left;
+                img.cropHeight = bottom - top;
+            }
+        }
+    }
+
     // ---- black and white levels ---------------------------------------------
     {
         const unsigned patRows = c.cblack[4], patCols = c.cblack[5];

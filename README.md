@@ -7,7 +7,7 @@ Decoding is done by [LibRaw](https://www.libraw.org/), so every camera LibRaw
 knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. LibRaw is the only dependency.
 
-Status: **0.2.0, early**. It works on the cameras listed under
+Status: **0.3.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -22,7 +22,11 @@ Status: **0.2.0, early**. It works on the cameras listed under
 - Metadata: the camera's complete EXIF and GPS directories and its maker
   note are carried over, read directly from the source file. Maker and model
   keep the camera's own spelling.
-- Copies the camera's embedded JPEG preview, so file browsers show a thumbnail.
+- Previews in the standard DNG arrangement: a small thumbnail rendered from
+  the raw data in the first image directory, where file browsers look, and
+  the camera's own full-size JPEG as a second preview.
+- Fingerprints (`NewRawImageDigest`, `RawDataUniqueID`), so a reader can
+  detect damaged raw data and recognise the same exposure again.
 - `--verify` re-reads each DNG and compares every sample with the source.
 - Writes through a temporary file, so an interrupted run leaves no half DNG.
 
@@ -93,7 +97,7 @@ error.
 
 ## What has been tested
 
-Each file below was converted and then checked four ways:
+Each file below was converted and then checked five ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -105,34 +109,42 @@ Each file below was converted and then checked four ways:
 4. **Same metadata**: every EXIF, GPS and maker-note tag was read from source
    and DNG with ExifTool and with exiv2 and the values compared; see
    [Metadata](#metadata).
+5. **Adobe's reference validator**: `dng_validate` from the DNG SDK 1.5.1
+   reads every file without an error. It decodes the raw data with Adobe's
+   own code, recomputes the image digest and compares it with the stored one,
+   and parses both copies of the maker note. Its only remarks are three
+   warnings about values the cameras themselves wrote (an Olympus user
+   comment, two Samsung exposure fields).
 
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
-| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 37.9 MB | none (max 1/255) |
-| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 25.1 MB | none |
-| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.8 MB | none |
-| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 20.5 MB | none |
-| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 6.3 MB | none |
-| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.5 MB | none |
-| Nikon D3S | NEF | Bayer | 10.2 MB | 9.6 MB | none |
-| Nikon D4 | NEF | Bayer | 16.4 MB | 16.0 MB | none |
-| Olympus E-M10 | ORF | Bayer | 13.8 MB | 16.0 MB | none |
-| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 19.0 MB | 50 defect pixels, see below |
-| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 39.3 MB | none |
-| Samsung NX3000 | SRW | Bayer | 26.2 MB | 26.8 MB | none |
-| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 27.0 MB | none |
-| Sony NEX-5N | ARW | Bayer | 16.3 MB | 22.1 MB | none |
+| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 38.0 MB | none (max 1/255) |
+| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 25.3 MB | none |
+| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.9 MB | none |
+| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 20.6 MB | none |
+| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 6.5 MB | none |
+| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.6 MB | none |
+| Nikon D3S | NEF | Bayer | 10.2 MB | 9.7 MB | none |
+| Nikon D4 | NEF | Bayer | 16.4 MB | 16.1 MB | none |
+| Olympus E-M10 | ORF | Bayer | 13.8 MB | 16.1 MB | none |
+| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 19.1 MB | 50 defect pixels, see below |
+| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 39.4 MB | none |
+| Samsung NX3000 | SRW | Bayer | 26.2 MB | 27.0 MB | none |
+| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 27.1 MB | none |
+| Sony NEX-5N | ARW | Bayer | 16.3 MB | 22.2 MB | none |
 
-Sizes include the embedded preview and the maker note, which is stored twice
-(see [Metadata](#metadata)). A DNG can be larger than its source when the
+Sizes include the thumbnail (about 130 KB, uncompressed), the camera's JPEG
+preview and the maker note, which is stored twice (see
+[Metadata](#metadata)). A DNG can be larger than its source when the
 camera uses lossy compression (Sony ARW) or a more modern lossless coder
 (Canon CR3), which DNG's lossless JPEG cannot match, or when the maker note is
 large: the Olympus one is 1.4 MB because it contains a preview image.
 
 Checked with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18 on Linux, and under
 AddressSanitizer and UndefinedBehaviorSanitizer. The macOS and Windows builds
-in the CI workflow have not been run yet, and the files have not been opened
-in Adobe software.
+in the CI workflow have not been run yet. Adobe's validator is the reference
+reader, but the files have not been opened in Lightroom or Camera Raw
+themselves.
 
 ## Metadata
 
@@ -176,7 +188,7 @@ maker note of the source and finds with the same value in the DNG:
 
 | Camera | Maker-note tags | EXIF directory | GPS |
 |---|---:|---:|---|
-| Canon EOS R8 (CR3) | 234 of 234 | 39 of 39 | none |
+| Canon EOS R8 (CR3) | 234 of 234 | 38 of 39 | none |
 | Canon EOS 5D Mark II | 303 of 303 | 29 of 29 | none |
 | Canon EOS 40D | 282 of 282 | 29 of 29 | none |
 | Fujifilm X-E1 | 47 of 47 | 40 of 40 | none |
@@ -192,6 +204,9 @@ maker note of the source and finds with the same value in the DNG:
 | Kodak DC50 | no maker note | no EXIF directory | none |
 
 The one EXIF tag missing in four rows is `CFAPattern`, left out on purpose.
+In the Canon EOS R8 row it is `LensSpecification`, which is copied with one
+correction: the camera writes 0/1 for an aperture it does not know, where the
+EXIF standard asks for 0/0.
 The seven Samsung tags belong to a preview directory the maker note points to
 but which lies outside it. exiv2 0.27 agrees with the table: every tag it
 decodes from a source's maker note has the same value in the DNG.
@@ -228,6 +243,24 @@ opcode (`FixBadPixelsConstant`) asking the reader to interpolate over them.
 Readers that implement opcodes repair them; readers that do not (LibRaw-based
 ones, for instance) show them as dark dots.
 
+**Thumbnail.** The 256-pixel thumbnail is a quick rendering of the raw data:
+block averages instead of demosaicing, the colour matrix, as-shot white
+balance, and automatic brightening by at most two stops. It follows the
+default crop and, like the raw data, relies on the `Orientation` tag for
+rotation. It will not match the camera's JPEG exactly; that one is stored next
+to it, unchanged. `--no-preview` leaves out the camera's JPEG but keeps the
+thumbnail.
+
+**Default crop.** When the source says which part of the sensor is the
+picture, that becomes the default crop. Otherwise the whole active area is
+used. Either way a margin of two pixels is kept to the edge of the active
+area, which a mosaic needs for interpolation and DNG readers check for.
+
+**Fingerprints.** `NewRawImageDigest` is computed over the stored samples the
+way Adobe's SDK defines it, so any DNG reader can verify the raw data.
+`RawDataUniqueID` combines it with the camera model, crop and opcodes: two
+conversions of the same file get the same ID.
+
 **White level.** When the camera recorded its own saturation level and that
 level is lower than the format maximum, dngconv uses the camera's value. This
 is the safer choice for highlight recovery, but it can make a DNG render a
@@ -256,8 +289,8 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
   distribution packages are not.
 - A second calibration illuminant, DNG 1.6/1.7 features (JPEG XL compression
   among them).
-- An uncompressed thumbnail in IFD0. The preview stored there is the camera's
-  JPEG, which every reader tried so far accepts.
+- A JPEG preview for cameras whose files carry none (only the thumbnail is
+  written then), and re-rendering previews at a chosen size.
 
 ## How the source is organised
 
@@ -267,10 +300,12 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 | `src/raw_reader.*` | LibRaw to `RawImage` |
 | `src/source_metadata.*` | Reads maker, model, EXIF, GPS and the maker note from the source's own structures (TIFF-based raws, CR3, RAF, RW2) |
 | `src/dng_writer.*` | `RawImage` to DNG |
+| `src/thumbnail.*` | Renders the small RGB thumbnail from the raw data |
 | `src/ljpeg92.*` | Lossless JPEG encoder |
+| `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset |
 | `src/main.cpp` | Command line |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

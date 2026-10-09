@@ -35,8 +35,13 @@ struct DngWriteOptions {
     uint32_t tileSize = 512;
     /// Worker threads for compression; 0 = one per CPU core.
     unsigned threads = 0;
+    /// Render a small RGB thumbnail from the raw data and store it in the
+    /// first image directory, where file browsers look for it.
+    bool embedThumbnail = true;
     /// Store the source file's JPEG preview, when the RawImage carries one.
     bool embedPreview = true;
+    /// Write NewRawImageDigest and RawDataUniqueID.
+    bool digests = true;
     /// Carry over the camera maker's private metadata block. The rest of the
     /// copied metadata (EXIF, GPS) is written whenever the RawImage has it.
     bool makerNotes = true;

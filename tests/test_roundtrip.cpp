@@ -368,7 +368,6 @@ int main(int argc, char** argv) {
 
     // Container structure, checked with the independent TIFF parser.
     {
-        // No preview: the raw image is IFD0, with the DNG identification tags.
         RawImage img = cases.front().image;
         img.zeroIsBadPixel = true;
         img.lensInfo = {24, 240, 4, 0};  // last aperture unknown
@@ -382,34 +381,57 @@ int main(int argc, char** argv) {
         const fs::path file = dir / "dngconv_test_structure.dng";
         writeDng(img, file);
         const std::string bytes = tiffreader::slurp(file);
+
+        // IFD0: the rendered thumbnail and everything that describes the camera.
         const tiffreader::Ifd ifd0 = tiffreader::parseFirstIfd(bytes);
-        CHECK(ifd0.at(254).u32() == 0);                 // full-resolution image
-        CHECK(ifd0.at(262).u16() == 32803);             // colour filter array
-        CHECK(ifd0.at(259).u16() == 7);                 // lossless JPEG
+        CHECK(ifd0.at(254).u32() == 1);                 // reduced-resolution image
+        CHECK(ifd0.at(262).u16() == 2);                 // RGB
+        CHECK(ifd0.at(259).u16() == 1);                 // uncompressed
+        CHECK(ifd0.at(258).count == 3 && ifd0.at(258).u16(0) == 8);
+        CHECK(ifd0.at(277).u16() == 3);
+        // 1008 x 752 default crop, longest edge scaled to 256.
+        CHECK(ifd0.at(256).u32() == 256 && ifd0.at(257).u32() == 191);
+        CHECK(ifd0.at(278).u32() == 191);
+        CHECK(ifd0.at(279).u32() == 256u * 191u * 3u);
+        CHECK(ifd0.at(273).u32() + ifd0.at(279).u32() <= bytes.size());
         CHECK(ifd0.at(50706).data == std::vector<uint8_t>({1, 4, 0, 0}));
         CHECK(ifd0.at(50707).data == std::vector<uint8_t>({1, 3, 0, 0}));
         CHECK(ifd0.at(50708).text() == "Testmake Model T");
         CHECK(ifd0.at(271).text() == "Testmake" && ifd0.at(272).text() == "Model T");
         CHECK(ifd0.at(274).u16() == 6);
-        CHECK(ifd0.at(33421).u16(0) == 2 && ifd0.at(33421).u16(1) == 2);
-        CHECK(ifd0.at(33422).data == std::vector<uint8_t>({0, 1, 1, 2}));
-        CHECK(ifd0.at(50829).u32(0) == 6 && ifd0.at(50829).u32(1) == 10 &&
-              ifd0.at(50829).u32(2) == 762 && ifd0.at(50829).u32(3) == 1030);
-        CHECK(ifd0.at(50719).u32(0) == 4 && ifd0.at(50719).u32(1) == 2);
-        CHECK(ifd0.at(50720).u32(0) == 1008 && ifd0.at(50720).u32(1) == 752);
-        CHECK(ifd0.at(50717).number() == 4000);
         CHECK(ifd0.at(50721).count == 9 && ifd0.at(50728).count == 3);
         CHECK(ifd0.at(50736).u32(4) == 4 && ifd0.at(50736).u32(6) == 0 &&
               ifd0.at(50736).u32(7) == 0);
+        CHECK(ifd0.at(51111).type == 1 && ifd0.at(51111).count == 16);  // NewRawImageDigest
+        CHECK(ifd0.at(50781).type == 1 && ifd0.at(50781).count == 16);  // RawDataUniqueID
+        CHECK(ifd0.at(51111).data != ifd0.at(50781).data);
+        CHECK(ifd0.count(33422) == 0 && ifd0.count(50829) == 0);        // raw tags are not here
+
+        // SubIFD 0: the raw image.
+        CHECK(ifd0.at(330).count == 1);
+        const tiffreader::Ifd rawIfd = tiffreader::parseIfd(bytes, ifd0.at(330).u32());
+        CHECK(rawIfd.at(254).u32() == 0);                 // full-resolution image
+        CHECK(rawIfd.at(262).u16() == 32803);             // colour filter array
+        CHECK(rawIfd.at(259).u16() == 7);                 // lossless JPEG
+        CHECK(rawIfd.at(256).u32() == 1037 && rawIfd.at(257).u32() == 771);
+        CHECK(rawIfd.at(33421).u16(0) == 2 && rawIfd.at(33421).u16(1) == 2);
+        CHECK(rawIfd.at(33422).data == std::vector<uint8_t>({0, 1, 1, 2}));
+        CHECK(rawIfd.at(50829).u32(0) == 6 && rawIfd.at(50829).u32(1) == 10 &&
+              rawIfd.at(50829).u32(2) == 762 && rawIfd.at(50829).u32(3) == 1030);
+        CHECK(rawIfd.at(50719).u32(0) == 4 && rawIfd.at(50719).u32(1) == 2);
+        CHECK(rawIfd.at(50720).u32(0) == 1008 && rawIfd.at(50720).u32(1) == 752);
+        CHECK(rawIfd.at(50717).number() == 4000);
         // Tiles cover the frame: ceil(1037/512) x ceil(771/512).
-        CHECK(ifd0.at(322).u32() == 512 && ifd0.at(323).u32() == 512);
-        CHECK(ifd0.at(324).count == 6 && ifd0.at(325).count == 6);
+        CHECK(rawIfd.at(322).u32() == 512 && rawIfd.at(323).u32() == 512);
+        CHECK(rawIfd.at(324).count == 6 && rawIfd.at(325).count == 6);
         // Defect-pixel opcode. The active area starts at an even row and an
         // even column, so the frame origin has the same phase: red = 0.
-        CHECK(ifd0.at(51008).type == 7);
-        CHECK(ifd0.at(51008).data ==
+        CHECK(rawIfd.at(51008).type == 7);
+        CHECK(rawIfd.at(51008).data ==
               std::vector<uint8_t>({0, 0, 0, 1, 0, 0, 0, 4, 1, 3, 0, 0, 0, 0, 0, 1,
                                     0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0}));
+        CHECK(rawIfd.count(50706) == 0 && rawIfd.count(51111) == 0);  // camera tags stay in IFD0
+
         // EXIF sub-directory.
         const tiffreader::Ifd exif = tiffreader::parseIfd(bytes, ifd0.at(34665).u32());
         CHECK(exif.at(33434).u32(0) == 1 && exif.at(33434).u32(1) == 250);
@@ -424,29 +446,77 @@ int main(int argc, char** argv) {
         CHECK(gps.at(5).data.at(0) == 0);                        // above sea level
         CHECK(gps.at(6).u32(0) == 85 && gps.at(6).u32(1) == 2);  // 42.5 m
 
+        // The digests depend on the samples, not on how they are stored.
+        const std::vector<uint8_t> digest = ifd0.at(51111).data;
+        const std::vector<uint8_t> uniqueId = ifd0.at(50781).data;
+        DngWriteOptions other;
+        other.compression = DngCompression::None;
+        other.byteOrder = DngByteOrder::Big;
+        other.threads = 1;
+        writeDng(img, file, other);
+        const tiffreader::Ifd plain0 = tiffreader::parseFirstIfd(tiffreader::slurp(file));
+        CHECK(plain0.at(51111).data == digest && plain0.at(50781).data == uniqueId);
+        RawImage changed = img;
+        changed.pixels[changed.pixels.size() / 2] ^= 1;  // a single bit
+        writeDng(changed, file);
+        const tiffreader::Ifd changed0 = tiffreader::parseFirstIfd(tiffreader::slurp(file));
+        CHECK(changed0.at(51111).data != digest && changed0.at(50781).data != uniqueId);
+        // Same samples read differently (another crop): same digest, new identity.
+        RawImage recropped = img;
+        recropped.cropWidth -= 2;
+        writeDng(recropped, file);
+        const tiffreader::Ifd recropped0 = tiffreader::parseFirstIfd(tiffreader::slurp(file));
+        CHECK(recropped0.at(51111).data == digest && recropped0.at(50781).data != uniqueId);
+
         // Active area starting on an odd column shifts the phase: the frame
         // origin is then a green pixel on a red row.
         img.activeLeft = 11;
         img.cropWidth = 1000;
         writeDng(img, file);
-        const tiffreader::Ifd shifted = tiffreader::parseFirstIfd(tiffreader::slurp(file));
+        const std::string shiftedBytes = tiffreader::slurp(file);
+        const tiffreader::Ifd shifted = tiffreader::parseIfd(
+            shiftedBytes, tiffreader::parseFirstIfd(shiftedBytes).at(330).u32());
         CHECK(shifted.at(51008).data.at(27) == 1);
 
-        // With a preview, IFD0 describes the JPEG and points at the raw IFD.
-        writeDng(cases.back().image, file);
-        const std::string withPreview = tiffreader::slurp(file);
-        const tiffreader::Ifd p0 = tiffreader::parseFirstIfd(withPreview);
-        CHECK(p0.at(254).u32() == 1);                   // reduced-resolution image
-        CHECK(p0.at(256).u32() == 8 && p0.at(257).u32() == 8);
-        CHECK(p0.at(262).u16() == 6);                   // YCbCr
-        CHECK(p0.at(530).u16(0) == 2 && p0.at(530).u16(1) == 2);
-        CHECK(p0.at(279).u32() == cases.back().image.previewJpeg.size());
-        CHECK(p0.count(50706) == 1 && p0.count(50721) == 1);  // camera tags stay in IFD0
+        // With a camera preview there are two sub-directories: raw, then JPEG.
+        const RawImage& withJpeg = cases.back().image;
+        writeDng(withJpeg, file);
+        const std::string previewBytes = tiffreader::slurp(file);
+        const tiffreader::Ifd p0 = tiffreader::parseFirstIfd(previewBytes);
+        CHECK(p0.at(254).u32() == 1 && p0.at(262).u16() == 2);   // still the RGB thumbnail
+        CHECK(p0.at(330).count == 2);
+        const tiffreader::Ifd rawSub = tiffreader::parseIfd(previewBytes, p0.at(330).u32(0));
+        CHECK(rawSub.at(254).u32() == 0);
+        CHECK(rawSub.at(256).u32() == 400 && rawSub.at(257).u32() == 300);
+        CHECK(rawSub.count(51008) == 0);
+        const tiffreader::Ifd jpegSub = tiffreader::parseIfd(previewBytes, p0.at(330).u32(1));
+        CHECK(jpegSub.at(254).u32() == 1);                       // reduced-resolution image
+        CHECK(jpegSub.at(256).u32() == 8 && jpegSub.at(257).u32() == 8);
+        CHECK(jpegSub.at(259).u16() == 7 && jpegSub.at(262).u16() == 6);  // JPEG, YCbCr
+        CHECK(jpegSub.at(530).u16(0) == 2 && jpegSub.at(530).u16(1) == 2);
+        CHECK(jpegSub.at(279).u32() == withJpeg.previewJpeg.size());
+        CHECK(previewBytes.compare(jpegSub.at(273).u32(), withJpeg.previewJpeg.size(),
+                                   std::string(withJpeg.previewJpeg.begin(),
+                                               withJpeg.previewJpeg.end())) == 0);
+        CHECK(p0.count(50706) == 1 && p0.count(50721) == 1);     // camera tags stay in IFD0
         CHECK(p0.at(50707).data == std::vector<uint8_t>({1, 1, 0, 0}));
-        const tiffreader::Ifd rawIfd = tiffreader::parseIfd(withPreview, p0.at(330).u32());
-        CHECK(rawIfd.at(254).u32() == 0);
-        CHECK(rawIfd.at(256).u32() == 400 && rawIfd.at(257).u32() == 300);
-        CHECK(rawIfd.count(51008) == 0);
+
+        // The older layouts remain available: JPEG preview in IFD0 without a
+        // thumbnail, and the raw image itself in IFD0 with neither.
+        DngWriteOptions noThumbnail;
+        noThumbnail.embedThumbnail = false;
+        writeDng(withJpeg, file, noThumbnail);
+        const std::string jpegFirst = tiffreader::slurp(file);
+        const tiffreader::Ifd j0 = tiffreader::parseFirstIfd(jpegFirst);
+        CHECK(j0.at(259).u16() == 7 && j0.at(262).u16() == 6 && j0.at(330).count == 1);
+        CHECK(tiffreader::parseIfd(jpegFirst, j0.at(330).u32()).at(254).u32() == 0);
+
+        noThumbnail.embedPreview = false;
+        noThumbnail.digests = false;
+        writeDng(withJpeg, file, noThumbnail);
+        const tiffreader::Ifd bare0 = tiffreader::parseFirstIfd(tiffreader::slurp(file));
+        CHECK(bare0.at(254).u32() == 0 && bare0.at(262).u16() == 32803);
+        CHECK(bare0.count(330) == 0 && bare0.count(51111) == 0 && bare0.count(50781) == 0);
 
         if (!testutil::failureCount()) {
             std::error_code ec;

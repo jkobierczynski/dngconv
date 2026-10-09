@@ -4,7 +4,7 @@ Where dngconv stands, how it got there, and what comes next. The README says
 what the program does; this file records the progress and the reasons behind
 the decisions, so that work can be picked up again without rediscovering them.
 
-Last updated: 2026-10-09, at version 0.2.0.
+Last updated: 2026-10-09, at version 0.3.0.
 
 ## Status at a glance
 
@@ -16,13 +16,15 @@ Last updated: 2026-10-09, at version 0.2.0.
 | Colour (matrix, white balance, levels) | Working, one illuminant (D65) |
 | EXIF and GPS copy | Working for TIFF-based raws, CR3, RAF, RW2 |
 | Maker notes | Copied, stored twice; verified with ExifTool and exiv2 |
-| Embedded preview | Camera's JPEG copied into IFD0 |
+| Previews | Standard layout: rendered thumbnail in IFD0, raw image and camera JPEG in sub-directories |
+| Digests | `NewRawImageDigest` and `RawDataUniqueID`; the former confirmed by Adobe's validator |
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
 | macOS and Windows builds | Written, **never run** |
 | Release workflow (binaries on a version tag) | Written and linted; Linux leg simulated locally; **never run on GitHub** |
-| Adobe software (Lightroom, Camera Raw, `dng_validate`) | **Never tried** |
+| Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error |
+| Lightroom, Camera Raw | **Never tried** |
 | Git history, published releases | None yet |
 
 ## History
@@ -103,6 +105,42 @@ Problems found while verifying, and what was done:
 - `ci.yml` moved to `actions/checkout@v5`; the v4 line runs on Node 20, which
   GitHub is retiring from its runners.
 
+### 0.3.0 (2026-10-09): preview layout, digests, reference validator
+
+1. **Adobe's validator built from source.** A public repository (raw2dng)
+   carries the DNG SDK 1.5.1; `dng_validate` was compiled from it and run on
+   the 0.2.0 output before anything was changed. All 15 files passed without
+   an error, which was the first confirmation from Adobe's own reader for the
+   lossless JPEG encoder, the opcode list and the tag structure.
+2. **Thumbnail renderer** (`thumbnail`): block averages per colour plane,
+   colour matrix, white balance, sRGB curve, at most two stops of automatic
+   brightening.
+3. **Standard layout**: thumbnail in IFD0, raw image in the first
+   sub-directory, the camera's JPEG in the second.
+4. **MD5** (`md5`) and the two fingerprints.
+5. **New test program** (`test_preview`): MD5 against RFC 1321, digests
+   against values the validator accepted, thumbnail colours against an
+   independently computed forward model.
+
+Problems found, and what was done:
+
+| Finding | Resolution |
+|---|---|
+| The image digest is not what one would guess. The SDK hashes tiles of 256 x 256 pixels, each with its colour planes **one after the other** rather than interleaved, then hashes the tile digests. | Implemented as defined. Proven by the validator on mosaic, big-endian and three-plane files; flipping one bit of a stored digest makes it report a mismatch, so the check is real. |
+| Validator: "too little padding" on four edges for six files. It wants two pixels between the default crop and the active area of a mosaic. | The reader keeps a two-pixel margin. |
+| Validator: "zero entry in LensSpecification" for the Canon CR3. The camera writes 0/1 for an unknown aperture. | Normalised to 0/0 when the EXIF directory is copied. The one place where a copied value is changed. |
+| Thumbnails of night shots came out as grey fog with brightening up to eight times. | Limit of two stops. |
+| UBSan: `memcpy` with a null pointer when an empty opcode list was fed to MD5. | Empty updates return at once; covered by a test. |
+| One MD5 reference value in the new test was mistyped. | Checked all seven against Python's `hashlib`. |
+
+What the validator's verbose output also settled:
+
+- It reads the layout as intended: IFD0 "Preview Image", sub-directory 1
+  "Main Image", sub-directory 2 "Preview Image".
+- It parses **both** copies of the maker note: the EXIF one at its original
+  offset, and "MakerNote inside DNGPrivateData". That answers the open
+  question whether the private-data block is in the form Adobe's code expects.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -142,13 +180,22 @@ none and works for every reader. The file layout bends around it instead.
 
 **Maker note stored twice.** The EXIF copy serves ExifTool, exiv2 and
 everything built on them. The `DNGPrivateData` copy is the form Adobe's
-converter writes and the one most likely to be read by Adobe software, and it
-survives a rewrite of the file. The second claim is an assumption until tested.
+converter writes, and it survives a rewrite of the file. Adobe's SDK was later
+seen to read both copies (0.3.0 history).
 
 **No patching of unsafe fields.** `CFAPattern`, `OECF`,
 `SpatialFrequencyResponse` and `DeviceSettingDescription` have an inner layout
 that depends on the file's byte order. They are left out rather than
 converted.
+
+**Thumbnail rendered from the raw data, not from the camera's JPEG.** Decoding
+the JPEG would need a JPEG decoder; rendering needs about 230 lines and no
+dependency, works for files without a preview, and shows what the raw data
+actually holds. The camera's JPEG is kept next to it, untouched.
+
+**Thumbnail in sensor orientation.** DNG has one `Orientation` tag for the
+whole file; rotating the thumbnail ourselves would turn it twice in every
+reader that honours the tag.
 
 **Never overwrite, write through a temporary file.** A converter people point
 at their only copy of a photo archive should fail safe.
@@ -163,14 +210,24 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (4 programs) | CTest | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, DNG round trips through LibRaw in both byte orders |
+| Unit tests (5 programs) | CTest | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
+| Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
 | Structure | ExifTool 12.76 `-validate` | No complaints beyond those the source file already has, except two minor warnings about the private-data copy of the Samsung maker note |
 | Independent decoders | darktable 4.6.1 (rawspeed), RawTherapee 5.10 | The files open elsewhere, with the right colours and orientation, including big-endian and uncompressed ones |
+| Thumbnail | Pillow, reading IFD0 as a plain TIFF | A generic TIFF reader finds and shows the thumbnail; looked at next to the camera previews for all 15 files |
 | Metadata comparison | ExifTool 12.76, exiv2 0.27.6 | Each maker-note, EXIF and GPS tag has the same value in source and DNG |
 | Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions, and on truncated and byte-flipped copies of real files |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
+
+`dng_validate` is not part of this repository and is not needed to build or
+test dngconv. To build it, compile every `.cpp` in the SDK's `source` folder
+into one program with `qLinux=1 qDNGValidateTarget=1 qDNGUseLibJPEG=1
+qDNGThreadSafe=1 qDNGUseStdInt=1 qDNGLittleEndian=1`, link it with the XMP
+SDK, libjpeg and zlib, and force-include `<cctype>`, `<cstring>`, `<cstdlib>`
+and `<cstdio>` for current compilers. `dng_validate -v file.dng` prints every
+tag it reads.
 
 The comparison scripts were throwaway Python and are not in the repository.
 The render comparison develops both files with camera white balance, linear
@@ -182,7 +239,8 @@ their directory path.
 
 Not covered by any check so far:
 
-- Adobe software and Adobe's `dng_validate`.
+- Lightroom and Camera Raw themselves. The validator shares their reading
+  code but says nothing about how the pictures look there.
 - macOS and Windows, including Unicode file names on Windows.
 - Four-colour sensors (CMYG, RGBE), monochrome sensors, non-square pixels,
   multi-frame files: the code paths exist and are untested on real files.
@@ -193,37 +251,38 @@ Not covered by any check so far:
 
 Suggested order:
 
-1. **Try the files in Adobe software.** One hour with Lightroom or a build of
-   the DNG SDK's `dng_validate` could reorder everything below. It also
-   settles whether the private-data copy of the maker note earns its place.
+1. **Open the files in Lightroom or Camera Raw.** The reference validator
+   accepts them; what remains to be seen is colour and lens-profile matching
+   in the real applications.
 2. **Put the project on GitHub and run both workflows.** `ci.yml` and
    `release.yml` exist and have never executed there. Start `release.yml` by
    hand first ("Run workflow"), which builds the packages without publishing
    anything, and tag only once that is green.
-3. **Standard preview layout and digests.** Small uncompressed thumbnail in
-   IFD0 with the JPEG preview in a sub-directory, plus `RawDataUniqueID` and
-   `NewRawImageDigest`.
-4. **Embed the original raw** (`OriginalRawFileData`) and an `extract`
+3. **Embed the original raw** (`OriginalRawFileData`) and an `extract`
    command, so conversion becomes reversible. Needs zlib.
-5. **Maker data outside the maker note.** Sony `SR2Private`, which Adobe
+4. **Maker data outside the maker note.** Sony `SR2Private`, which Adobe
    stores as its own block in `DNGPrivateData`; the Canon CR3 timed-metadata
    track.
-6. **Lens corrections as opcodes** (`WarpRectilinear`, `FixVignetteRadial`)
+5. **Lens corrections as opcodes** (`WarpRectilinear`, `FixVignetteRadial`)
    for the mirrorless makers that store them in maker notes. Large: needs
    per-maker parsing.
-7. **Bring the comparison scripts into the repository** as a `tools/` folder,
-   so the checks above can be repeated by anyone with sample files.
-8. Smaller items: parallel conversion of several files, keeping file
+6. **Bring the comparison scripts into the repository** as a `tools/` folder,
+   with a recipe for building `dng_validate`, so the checks above can be
+   repeated by anyone with sample files.
+7. Smaller items: parallel conversion of several files, keeping file
    timestamps, picking up XMP sidecars, a `--byte-order` switch, detecting an
-   input that already is a DNG before decoding it.
-9. Further out: JPEG XL compression (DNG 1.7), Fuji Super CCD, floating-point
+   input that already is a DNG before decoding it, a JPEG preview for files
+   that carry none.
+8. Further out: JPEG XL compression (DNG 1.7), Fuji Super CCD, floating-point
    raws, a second calibration illuminant, a library interface.
 
 ## Open questions
 
-- **Is the private-data copy read by Adobe software, and is it needed?** If
-  Lightroom takes lens data from the EXIF copy, the second copy could become
-  optional and the exiv2 message would go away.
+- **Is the private-data copy of the maker note needed?** Adobe's SDK reads
+  both copies (see the 0.3.0 history), so either would do for Adobe software.
+  Dropping the private-data copy would silence the exiv2 message and save
+  space; keeping it protects the note when a program rewrites the DNG. Kept
+  for now.
 - **Samsung maker note in `DNGPrivateData`.** ExifTool decodes it wrongly.
   Either the original-offset convention differs for notes whose pointers are
   relative to the note itself, or it is a limitation in ExifTool. A DNG made
