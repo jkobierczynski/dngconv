@@ -17,6 +17,9 @@ struct RawReadOptions {
     bool loadPreview = true;
     /// Collect the source's EXIF and GPS directories and its maker note.
     bool copyMetadata = true;
+    /// Keep a copy of the whole source file in RawImage::originalFile, for
+    /// embedding in the DNG.
+    bool keepOriginalFile = false;
     /// Skip pixel decoding; only metadata and geometry are filled in.
     bool metadataOnly = false;
 };

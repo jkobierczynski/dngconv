@@ -14,6 +14,7 @@
 
 #include <libraw/libraw.h>
 
+#include "original_raw.hpp"
 #include "source_metadata.hpp"
 
 #if !LIBRAW_COMPILE_CHECK_VERSION_NOTLESS(0, 21)
@@ -524,6 +525,8 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
             }
         }
     }
+
+    if (options.keepOriginalFile && !options.metadataOnly) img.originalFile = readWholeFile(path);
 
     // ---- embedded preview ---------------------------------------------------
     if (options.loadPreview && !options.metadataOnly) {

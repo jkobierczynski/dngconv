@@ -130,8 +130,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkgconf || true
 
-      - name: Build LibRaw
-        run: ./vcpkg/vcpkg install "libraw:$TRIPLET" --clean-after-build
+      - name: Build LibRaw and zlib
+        run: ./vcpkg/vcpkg install "libraw:$TRIPLET" "zlib:$TRIPLET" --clean-after-build
 
       - name: Configure
         run: >

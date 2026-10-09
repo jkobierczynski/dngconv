@@ -151,6 +151,11 @@ struct RawImage {
     // ---- metadata copied from the source --------------------------------------
     SourceMetadata source;
 
+    // ---- the source file itself ----------------------------------------------
+    // Every byte of the file the image was decoded from, when it is to be
+    // embedded in the DNG so that the conversion can be undone. Empty otherwise.
+    std::vector<uint8_t> originalFile;
+
     // ---- embedded preview ---------------------------------------------------
     // A complete JPEG stream taken unchanged from the source file, or empty.
     std::vector<uint8_t> previewJpeg;

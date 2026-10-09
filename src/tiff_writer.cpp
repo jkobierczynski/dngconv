@@ -28,6 +28,9 @@ void put32(std::vector<uint8_t>& v, uint32_t x) {
 
 uint64_t evenSize(uint64_t n) { return n + (n & 1); }
 
+// Values at least this large are written after the image data.
+constexpr uint64_t kDeferredValueBytes = 4ull << 20;
+
 }  // namespace
 
 void toRational(double value, uint32_t& numerator, uint32_t& denominator) {
@@ -294,12 +297,18 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
         return at;
     };
 
+    // Very large values (an embedded original file) go last, so that the
+    // directories and the pictures stay close to the start of the file.
+    std::vector<TiffIfd::Entry*> deferred;
     for (auto& ifd : ifds_) {
         ifd->offset_ = allocate(2 + 12 * static_cast<uint64_t>(ifd->entries_.size()) + 4);
         ifd->placed_ = true;
         for (auto& [tag, e] : ifd->entries_) {
             (void)tag;
-            if (e.data.size() > 4 && !(e.pinned && e.pinGranted))
+            if (e.data.size() <= 4 || (e.pinned && e.pinGranted)) continue;
+            if (e.data.size() >= kDeferredValueBytes)
+                deferred.push_back(&e);
+            else
                 e.valueOffset = allocate(e.data.size());
         }
     }
@@ -307,6 +316,7 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
         ifd->chunkOffsets_.clear();
         for (const auto& chunk : ifd->chunks_) ifd->chunkOffsets_.push_back(allocate(chunk.size()));
     }
+    for (TiffIfd::Entry* e : deferred) e->valueOffset = allocate(e->data.size());
     uint64_t fileEnd = cursor;
     for (const Span& f : fixed) fileEnd = std::max(fileEnd, evenSize(f.end));
     if (fileEnd > std::numeric_limits<uint32_t>::max())

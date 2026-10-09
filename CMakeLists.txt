@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.3.0 LANGUAGES CXX
+project(dngconv VERSION 0.4.0 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -73,6 +73,9 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# zlib compresses the original raw file when it is embedded in the DNG.
+find_package(ZLIB REQUIRED)
+
 # ---- warnings ---------------------------------------------------------------
 add_library(dngconv_warnings INTERFACE)
 if(MSVC)
@@ -89,16 +92,18 @@ add_library(dngconv_core STATIC
   src/dng_writer.cpp
   src/ljpeg92.cpp
   src/md5.cpp
+  src/original_raw.cpp
   src/raw_reader.cpp
   src/source_metadata.cpp
   src/thumbnail.cpp
+  src/tiff_source.cpp
   src/tiff_writer.cpp)
 target_include_directories(dngconv_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(dngconv_core
   PUBLIC Threads::Threads
-  PRIVATE dngconv_libraw dngconv_warnings)
+  PRIVATE dngconv_libraw ZLIB::ZLIB dngconv_warnings)
 
 add_executable(dngconv src/main.cpp)
 target_link_libraries(dngconv PRIVATE dngconv_core dngconv_warnings)
@@ -128,6 +133,10 @@ if(DNGCONV_BUILD_TESTS)
   add_executable(test_preview tests/test_preview.cpp)
   target_link_libraries(test_preview PRIVATE dngconv_core dngconv_warnings)
   add_test(NAME preview COMMAND test_preview ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(test_original tests/test_original.cpp)
+  target_link_libraries(test_original PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME original COMMAND test_original ${CMAKE_CURRENT_BINARY_DIR})
 
   add_executable(test_roundtrip tests/test_roundtrip.cpp)
   target_link_libraries(test_roundtrip PRIVATE dngconv_core dngconv_warnings)

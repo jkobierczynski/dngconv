@@ -22,19 +22,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install LibRaw (Linux)
+      - name: Install LibRaw and zlib (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libraw-dev ninja-build
+          sudo apt-get install -y libraw-dev zlib1g-dev ninja-build
 
+      # zlib comes with the macOS SDK.
       - name: Install LibRaw (macOS)
         if: runner.os == 'macOS'
         run: brew install libraw ninja
 
-      - name: Install LibRaw (Windows)
+      - name: Install LibRaw and zlib (Windows)
         if: runner.os == 'Windows'
-        run: vcpkg install libraw:x64-windows
+        run: vcpkg install libraw:x64-windows zlib:x64-windows
 
       - name: Configure (Linux, macOS)
         if: runner.os != 'Windows'

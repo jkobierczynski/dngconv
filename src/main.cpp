@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
 #include <system_error>
@@ -22,6 +23,7 @@
 #endif
 
 #include "dng_writer.hpp"
+#include "original_raw.hpp"
 #include "raw_reader.hpp"
 #include "version.hpp"
 
@@ -36,6 +38,7 @@ struct Settings {
     DngCompression compression = DngCompression::LosslessJpeg;
     bool preview = true;
     bool makerNotes = true;
+    bool embedOriginal = false;
     bool recursive = false;
     bool force = false;
     bool verify = false;
@@ -46,13 +49,17 @@ struct Settings {
 
 struct Job {
     fs::path input;
-    fs::path relative;  // path below the output directory, extension still the source's
+    fs::path relative;   // path below the output directory, extension still the source's
+    bool named = false;  // given as a file argument, not found by scanning a folder
 };
 
 const char* const kUsage =
     "Usage: dngconv [options] <file or folder>...\n"
+    "       dngconv extract [options] <DNG file or folder>...\n"
     "\n"
-    "Converts camera raw files to Digital Negative (DNG).\n"
+    "Converts camera raw files to Digital Negative (DNG). The extract command\n"
+    "restores the original files from DNGs written with --embed-original;\n"
+    "see 'dngconv extract --help'.\n"
     "\n"
     "Options:\n"
     "  -o, --output <path>       output file (one input) or output folder\n"
@@ -60,13 +67,31 @@ const char* const kUsage =
     "  -c, --compression <mode>  lossless (default) or none\n"
     "      --no-preview          do not copy the embedded JPEG preview\n"
     "      --no-maker-notes      do not copy the camera maker's private metadata\n"
+    "  -e, --embed-original      store the source file inside the DNG, so that\n"
+    "                            'dngconv extract' can restore it later\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -f, --force               overwrite existing DNG files\n"
     "      --verify              re-read each DNG and compare it with the source\n"
+    "                            (pixels, and the embedded original if any)\n"
     "  -j, --jobs <n>            compression threads (default: all cores)\n"
     "  -i, --info                show what the decoder finds; write nothing\n"
     "  -q, --quiet               only report problems\n"
     "  -V, --version             show version information\n"
+    "  -h, --help                show this help\n";
+
+const char* const kExtractUsage =
+    "Usage: dngconv extract [options] <DNG file or folder>...\n"
+    "\n"
+    "Restores the original camera raw file stored in a DNG (by 'dngconv\n"
+    "--embed-original', or by another converter that embeds originals). The file\n"
+    "gets the name it had before conversion. Its checksum is verified first.\n"
+    "\n"
+    "Options:\n"
+    "  -o, --output <path>       output file (one input) or output folder\n"
+    "                            (default: next to each DNG)\n"
+    "  -r, --recursive           descend into sub-folders\n"
+    "  -f, --force               overwrite existing files\n"
+    "  -q, --quiet               only report problems\n"
     "  -h, --help                show this help\n";
 
 // Extensions picked up when a folder is given. Files named explicitly are
@@ -166,6 +191,8 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
             s.preview = false;
         } else if (a == "--no-maker-notes") {
             s.makerNotes = false;
+        } else if (a == "-e" || a == "--embed-original") {
+            s.embedOriginal = true;
         } else if (a == "-r" || a == "--recursive") {
             s.recursive = true;
         } else if (a == "-f" || a == "--force") {
@@ -189,21 +216,23 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
 }
 
 template <typename Iterator>
-void scanFolder(const fs::path& root, std::vector<Job>& jobs) {
+void scanFolder(const fs::path& root, const std::set<std::string>& extensions,
+                std::vector<Job>& jobs) {
     std::vector<fs::path> found;
     std::error_code ec;
     for (Iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
         std::error_code fileEc;
-        if (it->is_regular_file(fileEc) && rawExtensions().count(lowerExtension(it->path())))
+        if (it->is_regular_file(fileEc) && extensions.count(lowerExtension(it->path())))
             found.push_back(it->path());
     }
     std::sort(found.begin(), found.end());
-    for (const auto& f : found) jobs.push_back({f, fs::relative(f, root, ec)});
+    for (const auto& f : found) jobs.push_back({f, fs::relative(f, root, ec), false});
 }
 
 // Returns false if any input does not exist.
-bool collectJobs(const Settings& s, std::vector<Job>& jobs, bool& anyFolder) {
+bool collectJobs(const Settings& s, const std::set<std::string>& extensions,
+                 std::vector<Job>& jobs, bool& anyFolder) {
     bool ok = true;
     anyFolder = false;
     for (const std::string& arg : s.inputs) {
@@ -212,11 +241,11 @@ bool collectJobs(const Settings& s, std::vector<Job>& jobs, bool& anyFolder) {
         if (fs::is_directory(p, ec)) {
             anyFolder = true;
             if (s.recursive)
-                scanFolder<fs::recursive_directory_iterator>(p, jobs);
+                scanFolder<fs::recursive_directory_iterator>(p, extensions, jobs);
             else
-                scanFolder<fs::directory_iterator>(p, jobs);
+                scanFolder<fs::directory_iterator>(p, extensions, jobs);
         } else if (fs::exists(p, ec)) {
-            jobs.push_back({p, p.filename()});
+            jobs.push_back({p, p.filename(), true});
         } else {
             std::fprintf(stderr, "dngconv: %s: no such file or folder\n", arg.c_str());
             ok = false;
@@ -285,7 +314,18 @@ void printInfo(const fs::path& path, const RawReadResult& r) {
     } else {
         std::printf("  metadata      nothing to copy (format not understood or no EXIF)\n");
     }
-    if (r.sourceIsDng) std::printf("  note          this file already is a DNG\n");
+    if (r.sourceIsDng) {
+        std::printf("  note          this file already is a DNG\n");
+        try {
+            const EmbeddedOriginal original = readEmbeddedOriginal(path, false);
+            if (original.present)
+                std::printf("  original      embedded: %s (%s); restore it with 'dngconv extract'\n",
+                            original.fileName.empty() ? "unnamed" : original.fileName.c_str(),
+                            megabytes(original.originalSize).c_str());
+        } catch (const std::exception& e) {
+            std::printf("  original      embedded but unreadable: %s\n", e.what());
+        }
+    }
     for (const auto& w : r.warnings) std::printf("  warning       %s\n", w.c_str());
 }
 
@@ -309,18 +349,189 @@ void verifyOutput(const RawImage& source, const fs::path& dng) {
     if (b.activeTop != source.activeTop || b.activeLeft != source.activeLeft ||
         b.activeBottom != source.activeBottom || b.activeRight != source.activeRight)
         throw std::runtime_error("verification failed: active area differs after re-reading");
+
+    // The embedded original must come back byte for byte.
+    if (!source.originalFile.empty()) {
+        const EmbeddedOriginal original = readEmbeddedOriginal(dng);
+        if (!original.present)
+            throw std::runtime_error("verification failed: the embedded original is missing");
+        if (!original.hasDigest || !original.digestMatches)
+            throw std::runtime_error("verification failed: checksum of the embedded original");
+        if (unpackOriginalRaw(original.packed.data(), original.packed.size()) != source.originalFile)
+            throw std::runtime_error("verification failed: the embedded original differs from "
+                                     "the source file");
+    }
+}
+
+// Writes a file through a temporary one, so that an interrupted run leaves no
+// truncated file under the final name.
+void writeFileSafely(const fs::path& path, const std::vector<uint8_t>& bytes) {
+    fs::path tmp = path;
+    tmp += ".part";
+    try {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("cannot create " + show(tmp));
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        if (!out) throw std::runtime_error("write error on " + show(tmp));
+        fs::rename(tmp, path);
+    } catch (...) {
+        std::error_code ignored;
+        fs::remove(tmp, ignored);
+        throw;
+    }
+}
+
+// Decides whether -o names a file or a folder: a file only when there is
+// exactly one explicitly named input and the path is not an existing folder.
+bool outputIsSingleFile(const Settings& settings, const std::vector<Job>& jobs, bool anyFolder) {
+    if (settings.output.empty()) return false;
+    std::error_code ec;
+    const bool endsWithSeparator = settings.output.back() == '/' || settings.output.back() == '\\';
+    return jobs.size() == 1 && !anyFolder && !fs::is_directory(fs::u8path(settings.output), ec) &&
+           !endsWithSeparator;
+}
+
+bool parseExtractArguments(const std::vector<std::string>& args, Settings& s, int& exitCode) {
+    bool optionsDone = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (optionsDone || a.empty() || a[0] != '-' || a == "-") {
+            s.inputs.push_back(a);
+        } else if (a == "--") {
+            optionsDone = true;
+        } else if (a == "-h" || a == "--help") {
+            std::fputs(kExtractUsage, stdout);
+            exitCode = 0;
+            return false;
+        } else if (a == "-o" || a == "--output") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "dngconv: option %s needs a value\n", a.c_str());
+                return false;
+            }
+            s.output = args[++i];
+        } else if (a == "-r" || a == "--recursive") {
+            s.recursive = true;
+        } else if (a == "-f" || a == "--force") {
+            s.force = true;
+        } else if (a == "-q" || a == "--quiet") {
+            s.quiet = true;
+        } else {
+            std::fprintf(stderr, "dngconv extract: unknown option '%s'\n", a.c_str());
+            return false;
+        }
+    }
+    if (s.inputs.empty()) {
+        std::fputs(kExtractUsage, stderr);
+        return false;
+    }
+    return true;
+}
+
+// The extract command: restores embedded original files from DNGs.
+int runExtract(const std::vector<std::string>& args) {
+    Settings settings;
+    int exitCode = 2;
+    if (!parseExtractArguments(args, settings, exitCode)) return exitCode;
+
+    static const std::set<std::string> dngExtension = {".dng"};
+    std::vector<Job> jobs;
+    bool anyFolder = false;
+    const bool allFound = collectJobs(settings, dngExtension, jobs, anyFolder);
+    if (jobs.empty()) {
+        if (allFound) std::fprintf(stderr, "dngconv: no DNG files found\n");
+        return 1;
+    }
+    const bool outputIsFile = outputIsSingleFile(settings, jobs, anyFolder);
+    const fs::path outputRoot = settings.output.empty() ? fs::path() : fs::u8path(settings.output);
+
+    int extracted = 0, skipped = 0, failed = allFound ? 0 : 1;
+    for (const Job& job : jobs) {
+        const std::string name = show(job.input);
+        try {
+            const EmbeddedOriginal original = readEmbeddedOriginal(job.input);
+            if (!original.present) {
+                // In a folder, DNGs without an original are expected; a file
+                // asked for by name that has none is a failed request.
+                if (job.named) throw std::runtime_error("holds no embedded original");
+                ++skipped;
+                continue;
+            }
+            if (original.hasDigest && !original.digestMatches)
+                throw std::runtime_error("the embedded original is damaged (checksum mismatch); "
+                                         "nothing was written");
+            const std::vector<uint8_t> bytes =
+                unpackOriginalRaw(original.packed.data(), original.packed.size());
+
+            fs::path target;
+            if (outputIsFile) {
+                target = outputRoot;
+            } else {
+                // Without a recorded name, fall back to the DNG's own.
+                const fs::path fileName = original.fileName.empty()
+                                              ? fs::path(job.input.stem()) += ".original"
+                                              : fs::u8path(original.fileName);
+                const fs::path folder = outputRoot.empty() ? job.input.parent_path()
+                                                           : outputRoot / job.relative.parent_path();
+                target = folder / fileName;
+            }
+
+            std::error_code ec;
+            if (fs::exists(target, ec)) {
+                if (fs::equivalent(target, job.input, ec))
+                    throw std::runtime_error("output would overwrite the DNG itself");
+                if (!settings.force)
+                    throw std::runtime_error("'" + show(target) +
+                                             "' already exists (use --force to overwrite)");
+            }
+            if (target.has_parent_path()) {
+                fs::create_directories(target.parent_path(), ec);
+                if (ec)
+                    throw std::runtime_error("cannot create folder '" +
+                                             show(target.parent_path()) + "': " + ec.message());
+            }
+            writeFileSafely(target, bytes);
+            if (!settings.quiet) {
+                std::printf("%s -> %s  (%s%s)\n", name.c_str(), show(target).c_str(),
+                            megabytes(bytes.size()).c_str(),
+                            original.hasDigest ? ", checksum verified" : ", no checksum in file");
+                std::fflush(stdout);
+            }
+            ++extracted;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "dngconv: %s: %s\n", name.c_str(), e.what());
+            ++failed;
+        }
+    }
+
+    if (!settings.quiet && jobs.size() > 1) {
+        std::printf("%d extracted, %d failed", extracted, failed);
+        if (skipped) std::printf(", %d without an embedded original", skipped);
+        std::printf("\n");
+    }
+    if (extracted == 0 && failed == 0) {
+        std::fprintf(stderr, "dngconv: none of the DNG files holds an embedded original\n");
+        return 1;
+    }
+    return failed ? 1 : 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::vector<std::string> args = commandLine(argc, argv);
+    if (!args.empty() && args.front() == "extract")
+        return runExtract(std::vector<std::string>(args.begin() + 1, args.end()));
+    if (!args.empty() && args.front() == "convert") args.erase(args.begin());
+
     Settings settings;
     int exitCode = 2;
-    if (!parseArguments(commandLine(argc, argv), settings, exitCode)) return exitCode;
+    if (!parseArguments(args, settings, exitCode)) return exitCode;
 
     std::vector<Job> jobs;
     bool anyFolder = false;
-    bool allFound = collectJobs(settings, jobs, anyFolder);
+    bool allFound = collectJobs(settings, rawExtensions(), jobs, anyFolder);
     if (jobs.empty()) {
         if (allFound) std::fprintf(stderr, "dngconv: no raw files found\n");
         return 1;
@@ -346,16 +557,8 @@ int main(int argc, char** argv) {
     // ---- where the output goes ------------------------------------------------
     // -o names a file only when there is exactly one explicitly named input and
     // the path is not an existing folder; otherwise it is a folder.
-    fs::path outputRoot;
-    bool outputIsFile = false;
-    if (!settings.output.empty()) {
-        outputRoot = fs::u8path(settings.output);
-        std::error_code ec;
-        const bool endsWithSeparator =
-            settings.output.back() == '/' || settings.output.back() == '\\';
-        outputIsFile = jobs.size() == 1 && !anyFolder && !fs::is_directory(outputRoot, ec) &&
-                       !endsWithSeparator;
-    }
+    const fs::path outputRoot = settings.output.empty() ? fs::path() : fs::u8path(settings.output);
+    const bool outputIsFile = outputIsSingleFile(settings, jobs, anyFolder);
 
     DngWriteOptions writeOptions;
     writeOptions.compression = settings.compression;
@@ -391,6 +594,7 @@ int main(int argc, char** argv) {
             const auto started = std::chrono::steady_clock::now();
             RawReadOptions ro;
             ro.loadPreview = settings.preview;
+            ro.keepOriginalFile = settings.embedOriginal;
             RawReadResult source = readRaw(job.input, ro);
             if (source.sourceIsDng) throw std::runtime_error("already a DNG; skipped");
 
@@ -413,7 +617,10 @@ int main(int argc, char** argv) {
                 std::printf("%s -> %s  (%s, %s -> %s, %.1f s%s)\n", name.c_str(),
                             show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                             megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
-                            settings.verify ? ", verified" : "");
+                            settings.verify ? (settings.embedOriginal
+                                                   ? ", pixels and embedded original verified"
+                                                   : ", verified")
+                                            : "");
                 std::fflush(stdout);
             }
             ++converted;

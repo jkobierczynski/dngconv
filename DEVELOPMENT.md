@@ -4,7 +4,7 @@ Where dngconv stands, how it got there, and what comes next. The README says
 what the program does; this file records the progress and the reasons behind
 the decisions, so that work can be picked up again without rediscovering them.
 
-Last updated: 2026-10-09, at version 0.3.0.
+Last updated: 2026-10-09, at version 0.4.0.
 
 ## Status at a glance
 
@@ -19,11 +19,13 @@ Last updated: 2026-10-09, at version 0.3.0.
 | Previews | Standard layout: rendered thumbnail in IFD0, raw image and camera JPEG in sub-directories |
 | Digests | `NewRawImageDigest` and `RawDataUniqueID`; the former confirmed by Adobe's validator |
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
+| Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
 | macOS and Windows builds | Written, **never run** |
 | Release workflow (binaries on a version tag) | Written and linted; Linux leg simulated locally; **never run on GitHub** |
-| Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error |
+| Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error, with and without an embedded original |
+| Adobe DNG Converter (extracting our originals, and ours extracting theirs) | **Never tried** |
 | Lightroom, Camera Raw | **Never tried** |
 | Git history, published releases | None yet |
 
@@ -141,12 +143,85 @@ What the validator's verbose output also settled:
   offset, and "MakerNote inside DNGPrivateData". That answers the open
   question whether the private-data block is in the form Adobe's code expects.
 
+### 0.4.0 (2026-10-09): embedded original and `extract`
+
+1. **`tiff_source`** split out of `source_metadata`: the bounds-checked TIFF
+   reading that the metadata parser already had, now shared with the code
+   that looks for an embedded original in a DNG.
+2. **`parallel.hpp`** split out of `dng_writer`: the worker loop, now also
+   used to compress the blocks of the original.
+3. **`original_raw`**: packs a file into the `OriginalRawFileData` layout,
+   unpacks it, and finds tag, name and digest in a DNG. First use of zlib.
+4. **TIFF writer**: values of 4 MiB or more are placed after the image data.
+5. **`-e` / `--embed-original`**, off by default. `--verify` then also unpacks
+   the copy from the finished DNG and compares it with the source file.
+6. **`dngconv extract`**, and a line in `-i` output for a DNG that holds an
+   original.
+7. **New test program** (`test_original`), described below.
+
+The layout of `OriginalRawFileData`, since the specification spends one
+paragraph on it. Everything is big-endian, whatever the DNG's byte order:
+
+```
+fork 1 (the file's contents):
+    uint32  length of the uncompressed file
+    uint32  offset[blocks + 1]     blocks = ceil(length / 65536); offsets count
+                                   from the start of the fork; the first is
+                                   4 * (blocks + 2), the last is the fork's end
+    bytes   one complete zlib stream per 64 KiB block
+forks 2 to 8: uint32 0 each        Mac resource fork, file type, creator, and
+                                   the same four again for a .THM sidecar
+```
+
+An empty file is a zero length and nothing else, followed by the seven zeros.
+`OriginalRawFileDigest` is the MD5 of the tag's bytes as stored, not of the
+original file.
+
+Findings, and what was done:
+
+| Finding | Resolution |
+|---|---|
+| Adobe's validator does **not** check `OriginalRawFileDigest`, and does not unpack the data. A DNG with one bit flipped inside the embedded original validates without a remark. | The validator is no proof for this feature. The independent proof is ExifTool, which implements the same layout on its own: `exiftool -b -OriginalRawImage` returns the camera file byte for byte for all 15 samples. |
+| `dng_validate -dng`, which rewrites a file, drops the embedded original. | Documented in the README. Not something dngconv can prevent. |
+| The copy hardly compresses: between 76 % and 100 % of the source's size, 94 % or more for 12 of the 15 samples. Raw files are compressed already. | `-e` stays opt-in, and the README says that it doubles the file. |
+| The TIFF writer put all tag values before the image data. The copy would have pushed the first tile tens of megabytes into the file and made every pixel offset depend on `-e`. | Large values go after the image data, which also keeps the layout of the first part of the file the same with and without `-e`. |
+| A name read from `OriginalRawFileName` decides where `extract` writes. A crafted DNG could name `../../something` or `C:\...`. | The name is cut down to its last component for either separator; control characters and colons are removed, trailing dots and spaces too; `.` and `..` are refused. Without a usable name the output is the DNG's name with `.original` in place of `.dng`. |
+| A damaged length field could ask for a 4 GiB allocation from a file of a few kilobytes. | The announced length is checked against what the packed data could possibly hold before anything is allocated; block offsets must increase and stay inside the data; each block must unpack to exactly its expected size. |
+
+What `test_original` covers: pack and unpack for sizes from 0 to 200001 bytes
+around the block boundaries; the header layout byte by byte; streams built by
+hand in the test, with stored (uncompressed) deflate blocks and its own
+Adler-32, so the reader is checked against something our writer did not
+produce; truncated, bit-flipped and random input, which must fail with an
+error and never crash; a round trip through a real DNG in both byte orders;
+that a 5 MiB original lands behind the tiles; that a changed byte is reported
+as a digest mismatch; hostile file names; and DNGs without an original.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
 Adobe DNG SDK is not under an open-source licence, and libtiff has no DNG
 knowledge to speak of. Writing TIFF and lossless JPEG ourselves cost about 800
-lines and keeps LibRaw the only dependency.
+lines and kept LibRaw the only dependency until 0.4.0 added zlib.
+
+**zlib as a second dependency, instead of our own deflate.** The embedded
+original has to be readable by Adobe's converter and ExifTool, so the format
+is fixed: zlib streams. An inflater is small, but a deflater that compresses
+decently is not, and zlib is present on every system dngconv builds on (it is
+already a dependency of LibRaw in most packages).
+
+**The original is opt-in.** It doubles the output. People who convert to save
+space, or who keep their camera files anyway, should not pay for it by
+default. Adobe's converter makes the same choice.
+
+**Large values after the image data.** See the 0.4.0 history. The threshold of
+4 MiB is far above any maker note or preview pointer table and far below any
+camera file worth embedding.
+
+**`extract` refuses a copy whose checksum fails.** A restored raw file that is
+silently wrong is worse than none, because it looks like a backup. There is no
+override switch; ExifTool will extract the damaged data for anyone who wants
+to salvage it.
 
 **`RawImage` as the only meeting point.** The reader fills it, the writer
 consumes it, neither includes the other. That is what allows the tests to
@@ -210,7 +285,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (5 programs) | CTest | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, DNG round trips through LibRaw in both byte orders |
+| Unit tests (6 programs) | CTest | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -218,7 +293,8 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Independent decoders | darktable 4.6.1 (rawspeed), RawTherapee 5.10 | The files open elsewhere, with the right colours and orientation, including big-endian and uncompressed ones |
 | Thumbnail | Pillow, reading IFD0 as a plain TIFF | A generic TIFF reader finds and shows the thumbnail; looked at next to the camera previews for all 15 files |
 | Metadata comparison | ExifTool 12.76, exiv2 0.27.6 | Each maker-note, EXIF and GPS tag has the same value in source and DNG |
-| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions, and on truncated and byte-flipped copies of real files |
+| Reversibility | `dngconv extract`, ExifTool 12.76 `-OriginalRawImage`, `cmp` | The embedded copy comes back identical to the camera file, through our reader and through an independent one |
+| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
 
 `dng_validate` is not part of this repository and is not needed to build or
@@ -241,6 +317,13 @@ Not covered by any check so far:
 
 - Lightroom and Camera Raw themselves. The validator shares their reading
   code but says nothing about how the pictures look there.
+- Adobe's DNG Converter on embedded originals, in both directions: whether it
+  extracts ours, and whether `extract` reads theirs. The first is likely,
+  since ExifTool reads ours with code written for Adobe's files; the second
+  rests on the specification and on the hand-built streams in the test. No
+  Adobe-made DNG with an embedded original was at hand.
+- Originals of 4 GiB or more (refused), and memory use on very large files:
+  the source file and its packed copy are both held in memory.
 - macOS and Windows, including Unicode file names on Windows.
 - Four-colour sensors (CMYG, RGBE), monochrome sensors, non-square pixels,
   multi-frame files: the code paths exist and are untested on real files.
@@ -258,8 +341,9 @@ Suggested order:
    `release.yml` exist and have never executed there. Start `release.yml` by
    hand first ("Run workflow"), which builds the packages without publishing
    anything, and tag only once that is green.
-3. **Embed the original raw** (`OriginalRawFileData`) and an `extract`
-   command, so conversion becomes reversible. Needs zlib.
+3. **Try an Adobe-made DNG with an embedded original** in `dngconv extract`,
+   and one of ours in Adobe's DNG Converter ("Extract originals"). Closes the
+   last gap in the 0.4.0 verification.
 4. **Maker data outside the maker note.** Sony `SR2Private`, which Adobe
    stores as its own block in `DNGPrivateData`; the Canon CR3 timed-metadata
    track.
@@ -270,7 +354,10 @@ Suggested order:
    with a recipe for building `dng_validate`, so the checks above can be
    repeated by anyone with sample files.
 7. Smaller items: parallel conversion of several files, keeping file
-   timestamps, picking up XMP sidecars, a `--byte-order` switch, detecting an
+   timestamps (also for extracted originals), embedding a camera's `.THM`
+   sidecar with the original (forks 5 to 8 of the layout exist for that),
+   streaming the original instead of holding it in memory, picking up XMP
+   sidecars, a `--byte-order` switch, detecting an
    input that already is a DNG before decoding it, a JPEG preview for files
    that carry none.
 8. Further out: JPEG XL compression (DNG 1.7), Fuji Super CCD, floating-point
@@ -343,8 +430,8 @@ git push origin vX.Y.Z
 1. checks that the tag and the CMake version agree (`v0.2.0` and `v0.2.0-rc1`
    both fit version 0.2.0; a tag with a suffix becomes a pre-release) and
    creates a **draft** release;
-2. builds on three runners. LibRaw and what it needs (zlib, Little CMS,
-   JasPer) are compiled from source by vcpkg and linked statically, so the
+2. builds on three runners. LibRaw, zlib and what LibRaw needs besides
+   (Little CMS, JasPer) are compiled from source by vcpkg and linked statically, so the
    binaries run without anything installed;
 3. runs the tests and `dngconv --version` on each runner;
 4. packs `dngconv`, `README.md`, `LICENSE` and the licences of the linked
@@ -391,6 +478,9 @@ Conventions used so far:
 - Errors travel as exceptions inside the library and become one line on
   stderr in `main`. The source-metadata parser is the exception: it never
   throws and returns what it could read.
+- Anything read from a file is untrusted, DNGs included: offsets and counts
+  go through `tiff_source`, and names from a file never reach the file system
+  unfiltered.
 - Every multi-byte value handed to `TiffIfd` is little-endian; only
   `TiffWriter::write` knows the byte order of the file.
 - Tests are plain programs with counted checks (`tests/test_util.hpp`), no

@@ -15,6 +15,8 @@
 
 #include "ljpeg92.hpp"
 #include "md5.hpp"
+#include "original_raw.hpp"
+#include "parallel.hpp"
 #include "thumbnail.hpp"
 #include "tiff_writer.hpp"
 
@@ -71,6 +73,8 @@ constexpr uint16_t CameraSerialNumber = 50735;
 constexpr uint16_t LensInfo = 50736;
 constexpr uint16_t CalibrationIlluminant1 = 50778;
 constexpr uint16_t OriginalRawFileName = 50827;
+constexpr uint16_t OriginalRawFileData = 50828;
+constexpr uint16_t OriginalRawFileDigest = 50973;
 constexpr uint16_t DNGPrivateData = 50740;
 constexpr uint16_t RawDataUniqueID = 50781;
 constexpr uint16_t ActiveArea = 50829;
@@ -155,44 +159,6 @@ bool parseJpeg(const std::vector<uint8_t>& j, JpegInfo& info) {
         pos += 2 + len;
     }
     return false;
-}
-
-unsigned workerCount(unsigned requested, size_t jobs) {
-    unsigned n = requested ? requested : std::thread::hardware_concurrency();
-    if (n == 0) n = 1;
-    return static_cast<unsigned>(std::min<size_t>(n, std::max<size_t>(jobs, 1)));
-}
-
-// Runs fn(i) for i in [0, jobs) on a few threads; rethrows the first error.
-template <typename Fn>
-void parallelFor(size_t jobs, unsigned threads, Fn fn) {
-    const unsigned n = workerCount(threads, jobs);
-    if (n <= 1) {
-        for (size_t i = 0; i < jobs; ++i) fn(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    std::exception_ptr error;
-    std::mutex errorMutex;
-    auto worker = [&] {
-        for (;;) {
-            const size_t i = next.fetch_add(1);
-            if (i >= jobs) return;
-            try {
-                fn(i);
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(errorMutex);
-                if (!error) error = std::current_exception();
-                next.store(jobs);
-                return;
-            }
-        }
-    };
-    std::vector<std::thread> pool;
-    pool.reserve(n);
-    for (unsigned t = 0; t < n; ++t) pool.emplace_back(worker);
-    for (auto& t : pool) t.join();
-    if (error) std::rethrow_exception(error);
 }
 
 struct TileLayout {
@@ -599,6 +565,16 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         ifd0.setBytes(tag::NewRawImageDigest, digestBytes(imageDigest));
         ifd0.setBytes(tag::RawDataUniqueID,
                       digestBytes(rawDataUniqueId(img, imageDigest, opcodeList1)));
+    }
+
+    // ---- the original file ---------------------------------------------------------
+    if (options.embedOriginal && !img.originalFile.empty()) {
+        std::vector<uint8_t> packed = packOriginalRaw(img.originalFile, options.threads);
+        // Lets a reader tell a damaged copy from a sound one before relying on it.
+        ifd0.setBytes(tag::OriginalRawFileDigest,
+                      digestBytes(Md5::of(packed.data(), packed.size())));
+        const uint32_t packedSize = static_cast<uint32_t>(packed.size());
+        ifd0.setRaw(tag::OriginalRawFileData, 7, packedSize, std::move(packed));
     }
 
     // ---- camera and picture description (always in IFD0) ------------------------

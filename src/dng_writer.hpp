@@ -42,6 +42,9 @@ struct DngWriteOptions {
     bool embedPreview = true;
     /// Write NewRawImageDigest and RawDataUniqueID.
     bool digests = true;
+    /// Store RawImage::originalFile, when it is not empty, so the source file
+    /// can be recovered from the DNG.
+    bool embedOriginal = true;
     /// Carry over the camera maker's private metadata block. The rest of the
     /// copied metadata (EXIF, GPS) is written whenever the RawImage has it.
     bool makerNotes = true;
