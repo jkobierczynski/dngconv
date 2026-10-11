@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "dng_digest.hpp"
 #include "lens_opcodes.hpp"
 #include "ljpeg92.hpp"
 #include "md5.hpp"
@@ -191,8 +192,10 @@ TileLayout chooseTileLayout(const RawImage& img, uint32_t tileSize) {
 }
 
 // Lossless-JPEG tiles. TIFF tiles always have the full tile size, so tiles on
-// the right and bottom edges are padded. Padding repeats the last pixels with
-// a period of two, which keeps the mosaic phase and so costs almost nothing.
+// the right and bottom edges are padded, with whatever costs least to code:
+// to the right the last pixels are repeated with a period of two, which keeps
+// the mosaic phase; rows below the image are flat, each component holding the
+// value its predictor expects, so that every difference in them is zero.
 std::vector<std::vector<uint8_t>> compressTiles(const RawImage& img, const TileLayout& tile,
                                                 unsigned threads) {
     const uint32_t spp = img.samplesPerPixel;
@@ -216,9 +219,16 @@ std::vector<std::vector<uint8_t>> compressTiles(const RawImage& img, const TileL
         std::vector<uint16_t> buffer(tileRowSamples * tile.height);
         const uint32_t inside = tx + tile.width <= img.width ? tile.width : img.width - tx;
         for (uint32_t y = 0; y < tile.height; ++y) {
+            uint16_t* dst = &buffer[static_cast<size_t>(y) * tileRowSamples];
+            if (ty + y >= img.height && y > 0) {
+                // A row of padding: the first sample of each component is
+                // predicted from the row above, the others from their left.
+                const uint16_t* above = dst - tileRowSamples;
+                for (size_t i = 0; i < tileRowSamples; ++i) dst[i] = above[i % tile.components];
+                continue;
+            }
             const uint32_t sy = clampCoord(ty + y, img.height);
             const uint16_t* srcRow = &img.pixels[static_cast<size_t>(sy) * img.width * spp];
-            uint16_t* dst = &buffer[static_cast<size_t>(y) * tileRowSamples];
             std::copy_n(srcRow + static_cast<size_t>(tx) * spp, static_cast<size_t>(inside) * spp,
                         dst);
             for (uint32_t x = inside; x < tile.width; ++x) {
@@ -310,46 +320,6 @@ void copyFields(const std::vector<TiffField>& fields, TiffIfd& ifd, bool overwri
         } catch (const std::invalid_argument&) {
         }
     }
-}
-
-// NewRawImageDigest: a fingerprint of the stored raw samples that a reader can
-// recompute to detect damage. The DNG specification defers to Adobe's SDK for
-// the definition, which is: cut the frame into tiles of 256 x 256 pixels
-// (smaller at the right and bottom edges, and never larger than the frame);
-// take the MD5 of each tile's samples as little-endian 16-bit values, one
-// colour plane after the other; then take the MD5 of all tile digests in
-// row-major order.
-Md5Digest newRawImageDigest(const RawImage& img, unsigned threads) {
-    const uint32_t spp = img.samplesPerPixel;
-    const uint32_t tileW = std::min<uint32_t>(256, img.width);
-    const uint32_t tileH = std::min<uint32_t>(256, img.height);
-    const uint32_t across = (img.width + tileW - 1) / tileW;
-    const uint32_t down = (img.height + tileH - 1) / tileH;
-    std::vector<Md5Digest> tileDigests(static_cast<size_t>(across) * down);
-
-    parallelFor(tileDigests.size(), threads, [&](size_t index) {
-        const uint32_t left = static_cast<uint32_t>(index % across) * tileW;
-        const uint32_t top = static_cast<uint32_t>(index / across) * tileH;
-        const uint32_t w = std::min(tileW, img.width - left);
-        const uint32_t h = std::min(tileH, img.height - top);
-        std::vector<uint8_t> bytes(static_cast<size_t>(w) * h * spp * 2);
-        size_t at = 0;
-        for (uint32_t plane = 0; plane < spp; ++plane)
-            for (uint32_t y = 0; y < h; ++y) {
-                const uint16_t* row =
-                    &img.pixels[(static_cast<size_t>(top + y) * img.width + left) * spp + plane];
-                for (uint32_t x = 0; x < w; ++x) {
-                    const uint16_t v = row[static_cast<size_t>(x) * spp];
-                    bytes[at++] = static_cast<uint8_t>(v & 0xff);
-                    bytes[at++] = static_cast<uint8_t>(v >> 8);
-                }
-            }
-        tileDigests[index] = Md5::of(bytes.data(), bytes.size());
-    });
-
-    Md5 all;
-    for (const Md5Digest& d : tileDigests) all.update(d.data(), d.size());
-    return all.finish();
 }
 
 // RawDataUniqueID: the same for every DNG made from the same exposure, and
@@ -567,7 +537,8 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
 
     // ---- fingerprints -------------------------------------------------------------
     if (options.digests) {
-        const Md5Digest imageDigest = newRawImageDigest(img, options.threads);
+        const Md5Digest imageDigest = newRawImageDigest(
+            img.pixels.data(), img.width, img.height, img.samplesPerPixel, 2, options.threads);
         ifd0.setBytes(tag::NewRawImageDigest, digestBytes(imageDigest));
         // Every opcode list counts: they change how the data is rendered.
         std::vector<uint8_t> opcodes = opcodeList1;

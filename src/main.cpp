@@ -22,6 +22,7 @@
 #include <shellapi.h>
 #endif
 
+#include "dng_check.hpp"
 #include "dng_writer.hpp"
 #include "original_raw.hpp"
 #include "raw_reader.hpp"
@@ -57,10 +58,12 @@ struct Job {
 const char* const kUsage =
     "Usage: dngconv [options] <file or folder>...\n"
     "       dngconv extract [options] <DNG file or folder>...\n"
+    "       dngconv check [options] <DNG file or folder>...\n"
     "\n"
     "Converts camera raw files to Digital Negative (DNG). The extract command\n"
-    "restores the original files from DNGs written with --embed-original;\n"
-    "see 'dngconv extract --help'.\n"
+    "restores the original files from DNGs written with --embed-original; the\n"
+    "check command tells whether DNG files are still intact. See\n"
+    "'dngconv extract --help' and 'dngconv check --help'.\n"
     "\n"
     "Options:\n"
     "  -o, --output <path>       output file (one input) or output folder\n"
@@ -98,6 +101,23 @@ const char* const kExtractUsage =
     "  -f, --force               overwrite existing files\n"
     "  -q, --quiet               only report problems\n"
     "  -h, --help                show this help\n";
+
+const char* const kCheckUsage =
+    "Usage: dngconv check [options] <DNG file or folder>...\n"
+    "\n"
+    "Tells whether DNG files are still what their writer stored: recomputes the\n"
+    "checksum of the raw image data and of the embedded original file, if there\n"
+    "is one, and compares them with the checksums in the file. Works on DNGs\n"
+    "from any converter; files without checksums are reported as not verified.\n"
+    "\n"
+    "Options:\n"
+    "  -r, --recursive           descend into sub-folders\n"
+    "  -j, --jobs <n>            threads (default: all cores)\n"
+    "  -q, --quiet               only report files that are not intact\n"
+    "  -h, --help                show this help\n"
+    "\n"
+    "Exit status: 0 if no file is damaged, 1 if one is or could not be read,\n"
+    "2 for a usage error.\n";
 
 // Extensions picked up when a folder is given. Files named explicitly are
 // always tried, whatever their extension.
@@ -578,12 +598,112 @@ int runExtract(const std::vector<std::string>& args) {
     return failed ? 1 : 0;
 }
 
+bool parseCheckArguments(const std::vector<std::string>& args, Settings& s, int& exitCode) {
+    bool optionsDone = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (optionsDone || a.empty() || a[0] != '-' || a == "-") {
+            s.inputs.push_back(a);
+        } else if (a == "--") {
+            optionsDone = true;
+        } else if (a == "-h" || a == "--help") {
+            std::fputs(kCheckUsage, stdout);
+            exitCode = 0;
+            return false;
+        } else if (a == "-j" || a == "--jobs") {
+            char* end = nullptr;
+            const long n = i + 1 < args.size() ? std::strtol(args[i + 1].c_str(), &end, 10) : 0;
+            if (i + 1 >= args.size() || !end || *end || n < 1 || n > 1024) {
+                std::fprintf(stderr, "dngconv check: option %s needs a thread count\n", a.c_str());
+                return false;
+            }
+            s.threads = static_cast<unsigned>(n);
+            ++i;
+        } else if (a == "-r" || a == "--recursive") {
+            s.recursive = true;
+        } else if (a == "-q" || a == "--quiet") {
+            s.quiet = true;
+        } else {
+            std::fprintf(stderr, "dngconv check: unknown option '%s'\n", a.c_str());
+            return false;
+        }
+    }
+    if (s.inputs.empty()) {
+        std::fputs(kCheckUsage, stderr);
+        return false;
+    }
+    return true;
+}
+
+// The check command: compares DNG files with the checksums they carry.
+int runCheck(const std::vector<std::string>& args) {
+    Settings settings;
+    int exitCode = 2;
+    if (!parseCheckArguments(args, settings, exitCode)) return exitCode;
+
+    static const std::set<std::string> dngExtension = {".dng"};
+    std::vector<Job> jobs;
+    bool anyFolder = false;
+    const bool allFound = collectJobs(settings, dngExtension, jobs, anyFolder);
+    if (jobs.empty()) {
+        if (allFound) std::fprintf(stderr, "dngconv: no DNG files found\n");
+        return 1;
+    }
+
+    using State = DngCheck::State;
+    int intact = 0, damaged = 0, unverified = 0, failed = allFound ? 0 : 1;
+    for (const Job& job : jobs) {
+        const std::string name = show(job.input);
+        try {
+            const DngCheck c = checkDng(job.input, settings.threads);
+            if (c.damaged()) {
+                // A file that is cut short usually has more than one thing
+                // wrong with it; the cause is the useful message.
+                std::string what = c.truncated ? c.truncatedDetail : "";
+                if (!c.truncated && c.rawImage == State::Damaged) what = c.rawDetail;
+                if (!c.truncated && c.original == State::Damaged)
+                    what += (what.empty() ? "" : "; ") + c.originalDetail;
+                // On stdout like the other verdicts, so that one stream holds the whole report.
+                std::printf("%s: DAMAGED: %s\n", name.c_str(), what.c_str());
+                ++damaged;
+            } else if (c.intact()) {
+                if (!settings.quiet)
+                    std::printf("%s: intact (raw image%s)\n", name.c_str(),
+                                c.original == State::Intact ? ", embedded original" : "");
+                ++intact;
+            } else {
+                std::string what;
+                if (c.rawImage == State::Intact) what = "raw image intact";
+                else what = c.rawDetail;
+                if (c.original == State::Intact) what += "; embedded original intact";
+                else if (c.original == State::Unverified) what += "; embedded original " + c.originalDetail;
+                std::printf("%s: not verified: %s\n", name.c_str(), what.c_str());
+                ++unverified;
+            }
+            std::fflush(stdout);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "dngconv: %s: %s\n", name.c_str(), e.what());
+            ++failed;
+        }
+    }
+
+    if (!settings.quiet && jobs.size() > 1) {
+        std::printf("%zu checked: %d intact, %d damaged", jobs.size(), intact, damaged);
+        if (unverified) std::printf(", %d not verified", unverified);
+        if (failed) std::printf(", %d not readable", failed);
+        std::printf("\n");
+    }
+    return damaged || failed ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::vector<std::string> args = commandLine(argc, argv);
     if (!args.empty() && args.front() == "extract")
         return runExtract(std::vector<std::string>(args.begin() + 1, args.end()));
+    if (!args.empty() && args.front() == "check")
+        return runCheck(std::vector<std::string>(args.begin() + 1, args.end()));
     if (!args.empty() && args.front() == "convert") args.erase(args.begin());
 
     Settings settings;

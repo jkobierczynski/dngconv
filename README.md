@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.5.0, early**. It works on the cameras listed under
+Status: **0.5.1, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -36,6 +36,9 @@ Status: **0.5.0, early**. It works on the cameras listed under
   (`--embed-original`), and `dngconv extract` gets it back byte for byte, so
   a conversion can be undone.
 - `--verify` re-reads each DNG and compares every sample with the source.
+- `dngconv check` tells, years later, whether a DNG is still intact: it
+  recomputes the checksums of the raw data and of the embedded original.
+  It works on DNGs from other converters too.
 - Writes through a temporary file, so an interrupted run leaves no half DNG.
 
 ## Download
@@ -149,6 +152,56 @@ ExifTool can extract the file too
 (`exiftool -b -OriginalRawImage shot.dng > shot.ARW`), and `dngconv extract`
 is written to read originals embedded by other converters.
 
+### Checking that files are still intact
+
+A DNG written by dngconv carries a checksum of its raw image data
+(`NewRawImageDigest`) and, with `-e`, one of the embedded original.
+`dngconv check` recomputes both from what is in the file now:
+
+```sh
+dngconv check shot.dng                # one file
+dngconv check -r ~/dng                # a whole archive
+dngconv check -q -r ~/dng             # only say what is not intact
+```
+
+```
+  -r, --recursive           descend into sub-folders
+  -j, --jobs <n>            threads (default: all cores)
+  -q, --quiet               only report files that are not intact
+```
+
+```
+2019/IMG_0412.dng: intact (raw image, embedded original)
+2019/IMG_0413.dng: DAMAGED: the raw image data does not match its checksum
+2019/IMG_0414.dng: DAMAGED: the file is cut short: 300000 bytes are missing at its end
+2019/L1000123.dng: not verified: the file carries no checksum of its raw data
+4 checked: 1 intact, 2 damaged, 1 not verified
+```
+
+The exit status is 0 when no file is damaged, 1 when one is or could not be
+read, 2 for a usage error. A file without a checksum counts as neither.
+
+It works on DNGs from other converters and from cameras. Files made by
+Adobe's software carry the same checksum (or its predecessor,
+`RawImageDigest`, which is understood too); most cameras that write DNG do
+not record one, and such files can only be checked for being complete.
+
+What it covers, and what it cannot:
+
+- The raw image is decoded by dngconv's own code, not by LibRaw, and hashed
+  the way Adobe's SDK defines. A change of a single bit in the picture is
+  found.
+- The embedded original is compared with its checksum and unpacked.
+- Previews, thumbnail and metadata have no checksum in the DNG format. For
+  those the check can only tell whether the file is long enough to hold
+  everything its directories point to, which catches a file that was cut
+  short but not a changed byte.
+- The unused part of the last tiles (they are always stored at full size) is
+  not part of the picture, so a change there goes unreported; Adobe's
+  validator treats it the same.
+- Raw data stored as lossy JPEG, JPEG XL, Deflate or floating point is not
+  decoded; those files are reported as "not verified".
+
 ## What has been tested
 
 Each file below was converted and then checked in up to seven ways:
@@ -181,27 +234,28 @@ Each file below was converted and then checked in up to seven ways:
 
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
-| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 38.0 MB | none (max 1/255) |
-| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 25.3 MB | none |
-| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.9 MB | none |
-| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 20.6 MB | none |
-| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 6.5 MB | none |
+| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | none (max 1/255) |
+| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 24.1 MB | none |
+| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.0 MB | none |
+| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 19.3 MB | none |
+| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 5.8 MB | none |
 | Kodak DC50 | KDC | Bayer | 0.1 MB | 0.6 MB | none |
-| Nikon D3S | NEF | Bayer | 10.2 MB | 9.7 MB | none |
-| Nikon D4 | NEF | Bayer | 16.4 MB | 16.1 MB | none |
-| Olympus E-M10 | ORF | Bayer | 13.8 MB | 16.1 MB | none |
-| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 19.1 MB | 50 defect pixels, see below |
-| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 39.4 MB | none |
-| Samsung NX3000 | SRW | Bayer | 26.2 MB | 27.0 MB | none |
-| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 27.1 MB | none |
-| Sony NEX-5N | ARW | Bayer | 16.3 MB | 22.2 MB | none |
+| Nikon D3S | NEF | Bayer | 10.2 MB | 9.3 MB | none |
+| Nikon D4 | NEF | Bayer | 16.4 MB | 15.3 MB | none |
+| Olympus E-M10 | ORF | Bayer | 13.8 MB | 15.9 MB | none |
+| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 18.9 MB | 50 defect pixels, see below |
+| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 38.7 MB | none |
+| Samsung NX3000 | SRW | Bayer | 26.2 MB | 25.4 MB | none |
+| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 26.8 MB | none |
+| Sony NEX-5N | ARW | Bayer | 16.3 MB | 20.8 MB | none |
 
 Sizes include the thumbnail (about 130 KB, uncompressed), the camera's JPEG
 preview and the maker note, which is stored twice (see
 [Metadata](#metadata)). A DNG can be larger than its source when the
-camera uses lossy compression (Sony ARW) or a more modern lossless coder
-(Canon CR3), which DNG's lossless JPEG cannot match, or when the maker note is
-large: the Olympus one is 1.4 MB because it contains a preview image.
+camera uses lossy compression (Sony ARW), when decoding yields more samples
+than the camera stored (Canon sRAW keeps colour at half resolution), or when
+the maker note is large: the Olympus one is 1.4 MB because it contains a
+preview image.
 
 Checked with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18 on Linux, and under
 AddressSanitizer and UndefinedBehaviorSanitizer, including extraction from
@@ -470,12 +524,14 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 | `src/lens_data.*` | Reads each maker's lens-correction parameters into those curves |
 | `src/lens_opcodes.*` | Fits the curves to DNG's polynomials and builds the opcode list |
 | `src/thumbnail.*` | Renders the small RGB thumbnail from the raw data |
-| `src/ljpeg92.*` | Lossless JPEG encoder |
+| `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
+| `src/dng_digest.*` | The two raw image digests DNG defines |
+| `src/dng_check.*` | Reads a DNG's raw data as stored and compares the file with its checksums |
 | `src/parallel.hpp` | Runs a job list on all cores |
 | `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset |
-| `src/main.cpp` | Command line: conversion and `extract` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), DNG round trips on synthetic frames |
+| `src/main.cpp` | Command line: conversion, `extract` and `check` |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-09, at version 0.5.0.
+Last updated: 2026-10-11, at version 0.5.1.
 
 ## Status at a glance
 
@@ -21,15 +21,16 @@ Last updated: 2026-10-09, at version 0.5.0.
 | Digests | `NewRawImageDigest` and `RawDataUniqueID`; the former confirmed by Adobe's validator |
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
+| Checking existing DNGs (`check`) | Working; agrees with Adobe's validator on sound and damaged files, also for DNGs written by Adobe's SDK and by cameras |
 | Lens corrections as opcodes | Sony, Fujifilm, Panasonic, Olympus; distortion checked against each camera's own JPEG on five files |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
 | macOS and Windows builds | Build and pass the unit tests on GitHub's runners; no camera file converted there yet |
-| Release workflow (binaries on a version tag) | Working: releases 0.2.0 and 0.3.0 were built and published by it |
+| Release workflow (binaries on a version tag) | Working: every release up to 0.5.0 was built and published by it |
 | Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error, with and without an embedded original |
 | Adobe DNG Converter (extracting our originals, and ours extracting theirs) | **Never tried** |
 | Lightroom, Camera Raw | **Never tried** |
-| Repository | github.com/jkobierczynski/dngconv; 0.4.0 is committed but not tagged |
+| Repository | github.com/jkobierczynski/dngconv, tagged up to v0.5.0 |
 
 ## History
 
@@ -257,6 +258,52 @@ outside plausible bounds; and the opcode list arriving in a DNG. One check
 ties the test to reality: the Panasonic tag the test assembles, checksums
 included, must equal the 32 bytes of the real GF7 file.
 
+### 0.5.1 (2026-10-11): the `check` command
+
+1. **Lossless JPEG decoder** (`ljpeg92_decode.cpp`): every predictor, up to
+   four components, restart intervals, bounded on any input.
+2. **`dng_digest`**: the image digest moved out of the writer, joined by the
+   older `RawImageDigest` and by the 8-bit form of the newer one.
+3. **`dng_check`**: finds the raw image in a DNG, reads it as stored (strips
+   or tiles; uncompressed at 8, 16 or any packed depth in between, or
+   lossless JPEG), compares the digests, verifies the embedded original, and
+   checks that the file is long enough for everything its directories name.
+4. **`dngconv check`**.
+5. **New test program** (`test_check`), and the TIFF builder of the tests
+   moved into a header of its own.
+
+Why an own decoder, when LibRaw already reads DNG: the digests are defined
+over the samples **as stored**. LibRaw applies a DNG's linearisation table
+while decoding, so for the many files that have one its output cannot be
+hashed.
+
+Findings, and what was done:
+
+| Finding | Resolution |
+|---|---|
+| The first run reported 13 of 30 sound files as damaged, differently on each run. Tiles were read from one file stream by several threads. | Reading is serialised; decoding and hashing stay parallel. The unit tests had not caught it because their files fit in one tile; `test_check` now uses frames of several tiles on three threads. |
+| Of 150 single-bit changes made inside the raw data of six files, 6 went unnoticed. All six were in the last row of tiles, in the part of the stream that codes rows below the picture. Adobe's validator passes the same bytes. | Correct as it is: the picture is unchanged. Documented. |
+| **Those unused rows were expensive.** The writer filled them by repeating the last two rows, which lossless JPEG's horizontal predictor codes at full price. A bottom tile of the NEX-5N file spent 20 % or more of its bytes on rows nobody sees. | Rows below the picture are now flat, each component holding the value its predictor expects. DNGs of the 15 samples shrank by 4.8 % together, up to 9.8 % for frames that end shortly after a tile boundary; the samples are unchanged. |
+| A file cut off inside its preview or metadata passed, since no checksum covers those parts. | The check also computes how long the file must be for all strips, tiles and tag values of every directory, and reports the number of missing bytes. The odd padding byte at the very end is the only thing that can go missing unnoticed. |
+| Which sample width the newer digest hashes is not in the specification. From the SDK source: bytes for data stored with up to 8 bits, and also for deeper data that comes with a linearisation table of at most 256 entries; 16-bit words otherwise. | Implemented so, and confirmed on files Adobe's SDK wrote from 8-bit input with and without such a table. |
+
+How the decoder and the digests were verified beyond the unit tests:
+
+- **Against LibRaw**, on the six camera-written DNGs of the
+  metadata-extractor collection (DJI, LG, two Leica, Pentax: 16-bit and
+  packed 12-bit strips, one with 3028 strips of one row) and three of our
+  own: the samples read by `dng_check` equal LibRaw's.
+- **Against Adobe's writer**: `dng_validate -dng` rewrote those six, five of
+  ours and three hand-made 8- and 12-bit files. The results carry Adobe's
+  lossless JPEG streams (tiles of 256, 8- and 16-bit precision, one with
+  three components) and Adobe's digests. `check` calls all 14 intact.
+- **The older digest**: no writer at hand produces it, so
+  `NewRawImageDigest` was renamed to `RawImageDigest` in three of our files
+  and filled with our value. Adobe's validator accepts them and rejects a
+  fourth with one bit changed; so does `check`.
+- **Damage**: on 36 files with one flipped bit `check` and Adobe's validator
+  gave the same verdict 36 times.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -350,6 +397,12 @@ corrected radius.
 checksums that do not match, values outside what a lens could need: no
 opcode. A wrong warp is worse than none.
 
+**`check` has three verdicts, not two.** "Intact" is only said when a
+checksum was there and matched. A file without one, or with raw data in a
+form this program cannot decode, is "not verified": it is not damaged as far
+as anyone can tell, and it would be wrong to count it either way. The exit
+status follows damage only.
+
 **Never overwrite, write through a temporary file.** A converter people point
 at their only copy of a photo archive should fail safe.
 
@@ -363,7 +416,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (7 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, DNG round trips through LibRaw in both byte orders |
+| Unit tests (8 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -374,7 +427,8 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Reversibility | `dngconv extract`, ExifTool 12.76 `-OriginalRawImage`, `cmp` | The embedded copy comes back identical to the camera file, through our reader and through an independent one |
 | Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
-| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, and on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read |
+| The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
+| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
 
 `dng_validate` is not part of this repository and is not needed to build or
@@ -497,10 +551,9 @@ Choices made in the workflow, and what to revisit:
 - Unsigned macOS and Windows binaries trigger the usual first-run warnings
   (Gatekeeper, SmartScreen).
 
-What has and has not been tried: the workflow built and published releases
-0.2.0 and 0.3.0 without changes. Since then zlib joined the dependencies
-(0.4.0, added to the vcpkg step); that version of the release workflow has
-not run yet, because 0.4.0 was never tagged.
+What has been tried: the workflow built and published every release from
+0.2.0 to 0.5.0, the last two with zlib as a second dependency, without
+needing a change.
 
 Conventions used so far:
 

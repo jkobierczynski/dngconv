@@ -4,17 +4,13 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-09, at version 0.5.0.
+Last updated: 2026-10-11, at version 0.5.1.
 
 ## Needs someone with the software or an account
 
 These cannot be done from a Linux machine without Adobe software, and they
 close the largest gaps in the verification.
 
-- [ ] **Tag a release that includes zlib.** 0.4.0 was committed without a
-      tag, so the release workflow has not yet built the packages with the
-      second dependency. Running `release.yml` by hand ("Run workflow")
-      builds them without publishing anything.
 - [ ] **Convert camera files on macOS and Windows.** The unit tests pass
       there; no real file has gone through the released binaries.
 - [ ] **Open the DNGs in Lightroom or Camera Raw.** Adobe's validator accepts
@@ -62,6 +58,13 @@ close the largest gaps in the verification.
 
 ## Smaller items
 
+- [ ] `check`: decode Deflate-compressed and floating-point raw data, and
+      compare lossy-JPEG raw data with its own digest (`RawJPEGImageDigest`),
+      so that fewer files end up "not verified".
+- [ ] `check --add`: write the checksums into a DNG that has none, so that
+      camera-written DNGs can be watched from then on.
+- [ ] Tile sizes that divide the frame evenly, so that no padding is needed
+      at all (it is cheap since 0.5.1, not free).
 - [ ] Convert several files in parallel (today only the tiles of one file
       are compressed in parallel).
 - [ ] Keep file timestamps, for DNGs and for extracted originals.
