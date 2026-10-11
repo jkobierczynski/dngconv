@@ -4,3 +4,5 @@ cmake-build-*/
 *.part
 .vscode/
 .idea/
+__pycache__/
+verify-work/

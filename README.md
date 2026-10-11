@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.6.0, early**. It works on the cameras listed under
+Status: **0.6.1, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -291,7 +291,7 @@ Each file below was converted and then checked in up to seven ways:
 
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
-| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | none (max 1/255) |
+| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | none, see "What LibRaw decides" |
 | Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 24.1 MB | none |
 | Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.0 MB | none |
 | Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 19.3 MB | none |
@@ -313,6 +313,9 @@ camera uses lossy compression (Sony ARW), when decoding yields more samples
 than the camera stored (Canon sRAW keeps colour at half resolution), or when
 the maker note is large: the Olympus one is 1.4 MB because it contains a
 preview image.
+
+The scripts behind these checks are in `tools/`; `tools/verify.sh` runs them
+all on a folder of raw files (see `tools/README.md`).
 
 Checked with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18 on Linux, and under
 AddressSanitizer and UndefinedBehaviorSanitizer, including extraction from
@@ -547,10 +550,15 @@ look profiles; colours in Adobe software will therefore not be identical to
 those of an Adobe-made DNG. For cameras missing from LibRaw's table the matrix
 is derived from LibRaw's built-in camera-to-sRGB matrix, and dngconv says so.
 
-**What LibRaw decides.** Active area, black level and the camera table come
-from LibRaw, so results can differ slightly between LibRaw versions. The Canon
-EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
-6022 x 4024 from 0.22.0. The stored samples are the same either way.
+**What LibRaw decides.** Active area, black level and the colour matrix
+come from LibRaw, so a DNG depends on the LibRaw version dngconv was built
+with. The Canon EOS R8 file shows all three: version 0.21.2 gives an active
+area of 5999 x 3999, a black level of 2048 and one colour matrix, version
+0.22 gives 6022 x 4024, 2047 and a different, newer matrix. The stored
+samples are the same either way, and a DNG develops exactly like its source
+when both are read by the same LibRaw; read by another version, the colours
+of this camera differ slightly. The released binaries are built with the
+newer LibRaw.
 
 ## Not there yet
 
@@ -594,6 +602,9 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.
+
+`tools/` holds the scripts that check the converter against real camera
+files and other software; they are not needed to build or use it.
 
 Development history and design decisions are in `DEVELOPMENT.md`, open work
 in `TODO.md`.

@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.6.0.
+Last updated: 2026-10-11, at version 0.6.1.
 
 ## Status at a glance
 
@@ -332,6 +332,30 @@ Measured on the 15 samples with two cores: 10.9 s one file at a time, 8.2 s
 with two at once. The output is byte-identical either way, and so is the
 report apart from the timings.
 
+### 0.6.1 (2026-10-11): the verification tools
+
+1. **`tools/`**: the comparison scripts, rewritten to be run by others
+   (`compare_render.py`, `compare_metadata.py`, `compare_camera_jpeg.py`,
+   `measure_fringes.py`), a build recipe for Adobe's validator that starts
+   from nothing, and `verify.sh`, which converts a folder of raw files and
+   runs every check in turn.
+2. One fix in the converter that the tools turned up (last row below).
+
+Findings while turning the scripts into tools:
+
+| Finding | Resolution |
+|---|---|
+| Run again, the render comparison reported the Canon EOS R8 as different by a mean of 1 in 255, where 0.1.0 had recorded "none". The DNG was written with LibRaw 0.21.2 and compared by the LibRaw 0.22 inside rawpy, and the two have **different colour matrices** for that camera (and black levels one count apart). The earlier figure came from a DNG written with 0.22. | Not an error of the converter, but a real property: a DNG carries the matrix of the LibRaw it was made with. The script now pins the black level and, when pictures differ, compares again without colour conversion, reporting "same raw data and levels" with a note. The README says so too. |
+| `dngconv -i` showed a black level of 0 for the same file when built with LibRaw 0.22, which learns it only while decoding. Conversion was never affected, since it decodes. | In report mode a file whose black level is zero before decoding is decoded after all. |
+| A validator that cannot run produces no error messages either. | `verify.sh` counts a file as accepted only if `dng_validate` reached "Validation complete". |
+| Measured on a developed picture, blue fringes read half their size (0.5 px against 0.9 px on the sensor planes of the NEX-5N), with the SDK's demosaicing and with LibRaw's linear one. | `measure_fringes.py` works on the mosaic and prints the DNG opcode's correction next to the measurement. The green planes against each other read 0.05 to 0.10 px, which is its accuracy. |
+
+`verify.sh` on the 16 sample files: all eleven steps pass; one file is not
+readable by the decoder (Sigma X3F), one source cannot be developed by
+rawpy (the damaged Canon file), four files have a distortion opcode and
+match their camera JPEG. It was also run on a folder with spaces in file
+and folder names, and with the validator and Python missing or broken.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -485,14 +509,13 @@ SDK, libjpeg and zlib, and force-include `<cctype>`, `<cstring>`, `<cstdlib>`
 and `<cstdio>` for current compilers. `dng_validate -v file.dng` prints every
 tag it reads.
 
-The comparison scripts are Python (NumPy, SciPy, OpenCV, rawpy) and are not
-in the repository yet; bringing them in is on the list in `TODO.md`.
-The render comparison develops both files with camera white balance, linear
-demosaicing, no auto-brightness and the two LibRaw settings noted in the 0.1.0
-history, then compares the arrays. The metadata comparison runs
-`exiftool -a -G5 -s -u` on both files and compares the sets of tag and value,
-separating the EXIF copy of the maker note from the private-data copy by
-their directory path.
+The scripts for the checks that need camera files are in `tools/`, with a
+driver (`tools/verify.sh`) that runs them all and a recipe for building the
+validator; `tools/README.md` says what each proves. The measurements made
+once for a particular question (noise statistics for Sony's vignetting, the
+brightness comparison against the JPEGs, the knot-spacing experiments) were
+not kept as tools; the history sections describe them closely enough to
+redo.
 
 Not covered by any check so far:
 
@@ -544,9 +567,12 @@ cmake -S . -B build22 -DLIBRAW_INCLUDE_DIR=/path/to/LibRaw \
 After a change, with sample files at hand:
 
 ```sh
-build/dngconv --verify -o /tmp/out/ /path/to/samples     # must report no failure
-exiftool -validate -warning -error -a /tmp/out/*.dng
+tools/verify.sh /path/to/samples        # every check there is a tool for
 ```
+
+It needs ExifTool, Python with the packages in `tools/requirements.txt`, and
+Adobe's validator (`tools/dng-validate/build.sh`); steps whose tools are
+missing are skipped.
 
 ## Releases
 

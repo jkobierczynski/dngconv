@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.6.0.
+Last updated: 2026-10-11, at version 0.6.1.
 
 ## Needs someone with the software or an account
 
@@ -79,12 +79,11 @@ close the largest gaps in the verification.
 
 ## Verification and tooling
 
-- [ ] **Bring the comparison scripts into the repository** as a `tools/`
-      folder (render comparison, metadata comparison, and the lens checks:
-      matching a render against the camera's JPEG, measuring colour fringes
-      on the sensor planes), with a recipe for building `dng_validate`, so
-      the checks in `DEVELOPMENT.md` can be repeated by anyone with sample
-      files.
+- [ ] Run `tools/verify.sh` on macOS and Windows (Git Bash or WSL); it has
+      only been run on Linux.
+- [ ] A way to compare the raw samples a DNG stores with what LibRaw reads
+      from it, as was done by hand for the `check` command (it needs a small
+      program that dumps `readStoredRawImage`).
 - [ ] Find sample files for the code paths no real file has exercised:
       four-colour sensors (CMYG, RGBE), monochrome sensors, non-square pixels,
       a source file with XMP.

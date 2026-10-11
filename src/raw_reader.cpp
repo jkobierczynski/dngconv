@@ -239,6 +239,15 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
         if (dataError.reported)
             warnings.push_back("the decoder reported damaged raw data; the image may be "
                                "incomplete");
+    } else {
+        // For a few formats the decoder learns the black level only while
+        // decoding (Canon CR3 with LibRaw 0.22). A black level of zero in a
+        // file that has not been decoded is therefore not to be trusted:
+        // decode after all, quietly, so that the report shows the real one.
+        const auto& levels = lr.imgdata.color;
+        bool noBlack = levels.black == 0;
+        for (int i = 0; i < 4 && noBlack; ++i) noBlack = levels.cblack[i] == 0;
+        if (noBlack && levels.cblack[4] * levels.cblack[5] == 0) (void)lr.unpack();
     }
 
     const auto& internal = lr.get_internal_data_pointer()->internal_output_params;

@@ -1,0 +1,6 @@
+# For the Python scripts in this folder. Besides these: ExifTool on the PATH.
+numpy
+scipy
+opencv-python-headless
+rawpy
+pillow
