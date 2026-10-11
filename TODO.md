@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.7.0.
+Last updated: 2026-10-11, at version 0.8.0.
 
 ## Needs someone with the software or an account
 
@@ -50,8 +50,17 @@ close the largest gaps in the verification.
       stores as its own block in `DNGPrivateData`; the Canon CR3
       timed-metadata track (`CTMD`); the tags of the RAF and RW2 containers;
       the Samsung preview directory.
-- [ ] **A JPEG preview for files that carry none**, and re-rendering previews
-      at a chosen size. Needs a JPEG encoder.
+- [ ] **Rendered previews: what the first version left open.**
+      - Full-resolution previews, which need demosaicing (Bayer first;
+        X-Trans is a larger piece of work).
+      - Rendering with the embedded camera profile's matrices and tone
+        curve instead of the decoder's matrix and the built-in curve.
+      - Per-camera brightness: the built-in curve is the median of thirteen
+        cameras, and single cameras are up to a stop away from it.
+      - Sharpening for small sizes, and a quality setting on the command
+        line (the writer has one, fixed at 90).
+      - Look at them in file browsers and photo managers on the three
+        systems.
 - [ ] **A second calibration illuminant** (`ColorMatrix2`, standard light A)
       for files converted without `--profile`. LibRaw's table has only D65;
       the data would have to come from elsewhere.

@@ -40,6 +40,7 @@ constexpr uint16_t kSubIfds = 330;
 constexpr uint16_t kSampleFormat = 339;
 constexpr uint16_t kDngVersion = 50706;
 constexpr uint16_t kLinearizationTable = 50712;
+constexpr uint16_t kExtraCameraProfiles = 50933;
 constexpr uint16_t kRawImageDigest = 50972;
 constexpr uint16_t kNewRawImageDigest = 51111;
 
@@ -262,8 +263,8 @@ void openDng(Source& src, Opened& dng) {
 }
 
 // The size the file must at least have for everything its directories refer
-// to: the values of all entries, and the image data of the raw image and of
-// every preview.
+// to: the values of all entries, the image data of the raw image and of
+// every preview, and the extra camera profiles.
 uint64_t requiredSize(const Opened& dng) {
     const Tiff& tiff = dng.tiff;
     std::vector<std::vector<Entry>> all = dng.directories;
@@ -289,6 +290,30 @@ uint64_t requiredSize(const Opened& dng) {
                 needed = std::max(needed, static_cast<uint64_t>(offsets[i]) + counts[i]);
         }
     }
+    // Extra camera profiles: each a small directory structure of its own,
+    // with offsets counted from its first byte.
+    std::vector<uint32_t> profiles;
+    if (numbers(tiff, find(dng.ifd0, kExtraCameraProfiles), 4096, profiles))
+        for (const uint64_t at : profiles) {
+            uint8_t header[8];
+            needed = std::max<uint64_t>(needed, at + sizeof header);
+            if (!tiff.src->read(at, header, sizeof header)) continue;
+            const bool big = header[0] == 'M';
+            const uint64_t dirAt = at + get32(header + 4, big);
+            uint8_t countBytes[2];
+            needed = std::max<uint64_t>(needed, dirAt + 2);
+            if (!tiff.src->read(dirAt, countBytes, 2)) continue;
+            const unsigned count = get16(countBytes, big);
+            if (count > kMaxEntries) continue;
+            needed = std::max<uint64_t>(needed, dirAt + 2 + 12ull * count + 4);
+            std::vector<uint8_t> raw(12u * count);
+            if (!tiff.src->read(dirAt + 2, raw.data(), raw.size())) continue;
+            for (unsigned i = 0; i < count; ++i) {
+                const uint8_t* e = &raw[12u * i];
+                const uint64_t size = static_cast<uint64_t>(tiffTypeSize(get16(e + 2, big))) * get32(e + 4, big);
+                if (size > 4) needed = std::max<uint64_t>(needed, at + get32(e + 8, big) + size);
+            }
+        }
     return needed;
 }
 

@@ -13,7 +13,7 @@
 #include "dng_writer.hpp"
 #include "md5.hpp"
 #include "test_util.hpp"
-#include "thumbnail.hpp"
+#include "render.hpp"
 #include "tiff_reader.hpp"
 
 using namespace dngconv;
@@ -265,65 +265,65 @@ int main(int argc, char** argv) {
         img.cropTop = 2;
         img.cropWidth = 1008;
         img.cropHeight = 752;
-        RgbImage t = renderThumbnail(img);
+        RgbImage t = renderPicture(img);
         CHECK(t.width == 256 && t.height == 191);
         CHECK(t.pixels.size() == 256u * 191u * 3u);
 
-        ThumbnailOptions small;
+        RenderOptions small;
         small.maxSize = 64;
-        t = renderThumbnail(img, small);
+        t = renderPicture(img, small);
         CHECK(t.width == 64 && t.height == 48);
 
         img.scaleH = 2.0;  // pixels twice as wide as high
-        t = renderThumbnail(img);
+        t = renderPicture(img);
         CHECK(t.width == 256 && t.height == 95);
         img.scaleH = 1.0;
 
         RawImage portrait = frame(600, 900, 1);
-        t = renderThumbnail(portrait);
+        t = renderPicture(portrait);
         CHECK(t.width == 171 && t.height == 256);
 
         // Smaller than the limit: not enlarged, and never finer than the mosaic.
         RawImage tiny = frame(8, 6, 1);
-        t = renderThumbnail(tiny);
+        t = renderPicture(tiny);
         CHECK(t.width == 4 && t.height == 3);
         RawImage tinyRgb = frame(8, 6, 3);
-        t = renderThumbnail(tinyRgb);
+        t = renderPicture(tinyRgb);
         CHECK(t.width == 8 && t.height == 6);
 
         // Inconsistent input gives no picture rather than a crash.
         RawImage broken = img;
         broken.pixels.pop_back();
-        CHECK(renderThumbnail(broken).pixels.empty());
+        CHECK(renderPicture(broken).pixels.empty());
         broken = img;
         broken.cfaPattern.pop_back();
-        CHECK(renderThumbnail(broken).pixels.empty());
+        CHECK(renderPicture(broken).pixels.empty());
         broken = img;
         broken.cropWidth = 5000;
-        CHECK(renderThumbnail(broken).pixels.empty());
+        CHECK(renderPicture(broken).pixels.empty());
     }
 
     // ---- thumbnail: colour ----------------------------------------------------------------
     {
-        ThumbnailOptions plain;
-        plain.autoExposure = false;
+        RenderOptions plain;  // gamma only, so that the expected values are plain to state
+        plain.toneCurve = false;
 
         // A neutral subject comes out neutral, at the right level.
         const double grey[3] = {0.18, 0.18, 0.18};
         RawImage img = frame(640, 480, 1);
         paint(img, 0, 0, img.width, img.height, grey);
-        CHECK(uniform(renderThumbnail(img, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
+        CHECK(uniform(renderPicture(img, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
 
         // So does a coloured one.
         const double orange[3] = {0.6, 0.3, 0.1};
         paint(img, 0, 0, img.width, img.height, orange);
-        CHECK(uniform(renderThumbnail(img, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
+        CHECK(uniform(renderPicture(img, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
 
         // Black stays black; a saturated sensor renders white, not tinted.
         std::fill(img.pixels.begin(), img.pixels.end(), uint16_t{0});
-        CHECK(uniform(renderThumbnail(img, plain), 0, 0, 0, 0));
+        CHECK(uniform(renderPicture(img, plain), 0, 0, 0, 0));
         std::fill(img.pixels.begin(), img.pixels.end(), uint16_t{4000});
-        CHECK(uniform(renderThumbnail(img, plain), 255, 255, 255, 0));
+        CHECK(uniform(renderPicture(img, plain), 255, 255, 255, 0));
 
         // A black level that differs from cell to cell is taken out per cell.
         RawImage patterned = frame(640, 480, 1);
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
         patterned.blackLevel = {200, 240, 280, 320};
         paint(patterned, 0, 0, patterned.width, patterned.height, grey);
         // Levels are scaled against the highest black, so allow a little more room.
-        CHECK(uniform(renderThumbnail(patterned, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 6));
+        CHECK(uniform(renderPicture(patterned, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 6));
 
         // Only the default crop is shown: a saturated border must not appear.
         RawImage bordered = frame(700, 500, 1);
@@ -345,7 +345,7 @@ int main(int argc, char** argv) {
         bordered.cropWidth = 640;
         bordered.cropHeight = 460;
         paint(bordered, 28, 16, 28 + 640, 16 + 460, grey);
-        CHECK(uniform(renderThumbnail(bordered, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
+        CHECK(uniform(renderPicture(bordered, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
 
         // Other mosaic phases and a 6x6 pattern.
         for (const std::vector<uint8_t>& pattern :
@@ -354,26 +354,26 @@ int main(int argc, char** argv) {
             RawImage other = frame(640, 480, 1);
             other.cfaPattern = pattern;
             paint(other, 0, 0, other.width, other.height, orange);
-            CHECK(uniform(renderThumbnail(other, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
+            CHECK(uniform(renderPicture(other, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
         }
         RawImage xtrans = frame(612, 408, 1);
         xtrans.cfaRows = xtrans.cfaCols = 6;
         xtrans.cfaPattern = {1, 1, 0, 1, 1, 2, 1, 1, 2, 1, 1, 0, 2, 0, 1, 0, 2, 1,
                              1, 1, 2, 1, 1, 0, 1, 1, 0, 1, 1, 2, 0, 2, 1, 2, 0, 1};
         paint(xtrans, 0, 0, xtrans.width, xtrans.height, orange);
-        CHECK(uniform(renderThumbnail(xtrans, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
+        CHECK(uniform(renderPicture(xtrans, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
 
         // Full-colour and monochrome data.
         RawImage rgb = frame(320, 240, 3);
         paint(rgb, 0, 0, rgb.width, rgb.height, orange);
-        CHECK(uniform(renderThumbnail(rgb, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
+        CHECK(uniform(renderPicture(rgb, plain), srgb8(0.6), srgb8(0.3), srgb8(0.1), 3));
         RawImage mono = frame(320, 240, 1);
         mono.isCfa = false;
         mono.colorPlanes = 1;
         mono.hasColorMatrix = false;
         mono.hasAsShotNeutral = false;
         paint(mono, 0, 0, mono.width, mono.height, grey);
-        CHECK(uniform(renderThumbnail(mono, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
+        CHECK(uniform(renderPicture(mono, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
 
         // Without a white balance in the file, daylight is assumed: a subject
         // lit by D65 is then neutral when the sensor shows the matrix's own
@@ -389,22 +389,49 @@ int main(int argc, char** argv) {
             for (uint32_t x = 0; x < daylight.width; ++x)
                 daylight.pixels[static_cast<size_t>(y) * daylight.width + x] = static_cast<uint16_t>(
                     std::lround(0.18 * white[daylight.cfaPattern[(y % 2) * 2 + x % 2]] / largest * 4000));
-        CHECK(uniform(renderThumbnail(daylight, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
+        CHECK(uniform(renderPicture(daylight, plain), srgb8(0.18), srgb8(0.18), srgb8(0.18), 2));
     }
 
-    // ---- thumbnail: exposure ---------------------------------------------------------------
+    // ---- rendering: the tone curve ----------------------------------------------------------
     {
-        RawImage img = frame(640, 480, 1);
-        const double half[3] = {0.5, 0.5, 0.5};
-        paint(img, 0, 0, img.width, img.height, half);
-        CHECK(uniform(renderThumbnail(img), 255, 255, 255, 1));  // brightened to white
+        // Black stays black, white stays white, and the curve only ever rises.
+        CHECK(renderToneCurve(0.0) == 0.0);
+        CHECK_NEAR(renderToneCurve(1.0), 1.0, 1e-12);
+        bool rising = true;
+        double previous = 0.0;
+        for (int i = 1; i <= 4000; ++i) {
+            const double v = renderToneCurve(i / 4000.0);
+            if (!(v > previous)) rising = false;
+            previous = v;
+        }
+        CHECK(rising);
+        // Mid-tones go up by about a stop, the deepest shadows are held down.
+        CHECK_NEAR(renderToneCurve(0.12), 0.245, 0.01);
+        CHECK_NEAR(renderToneCurve(0.18), 0.35, 0.02);
+        CHECK(renderToneCurve(0.5) > 0.65 && renderToneCurve(0.5) < 0.75);
+        CHECK(renderToneCurve(0.004) < 0.004);
+        // Outside its range it does not misbehave.
+        CHECK(renderToneCurve(-1.0) == 0.0);
+        CHECK_NEAR(renderToneCurve(7.0), 1.0, 1e-12);
 
-        const double dim[3] = {0.05, 0.05, 0.05};
+        // A picture goes through it unless told otherwise, and exposure is
+        // left as shot: a dim frame stays dim.
+        RawImage img = frame(640, 480, 1);
+        const double grey[3] = {0.18, 0.18, 0.18};
+        paint(img, 0, 0, img.width, img.height, grey);
+        const int lifted = srgb8(renderToneCurve(0.18));
+        CHECK(lifted > srgb8(0.18) + 20);
+        CHECK(uniform(renderPicture(img), lifted, lifted, lifted, 2));
+
+        const double dim[3] = {0.01, 0.01, 0.01};
         paint(img, 0, 0, img.width, img.height, dim);
-        CHECK(uniform(renderThumbnail(img), srgb8(0.2), srgb8(0.2), srgb8(0.2), 3));  // at most two stops
+        const int dark = srgb8(renderToneCurve(0.01));
+        CHECK(uniform(renderPicture(img), dark, dark, dark, 2));
 
         std::fill(img.pixels.begin(), img.pixels.end(), uint16_t{0});
-        CHECK(uniform(renderThumbnail(img), 0, 0, 0, 0));  // a black frame stays black
+        CHECK(uniform(renderPicture(img), 0, 0, 0, 0));
+        std::fill(img.pixels.begin(), img.pixels.end(), uint16_t{4000});
+        CHECK(uniform(renderPicture(img), 255, 255, 255, 0));
     }
 
     return testutil::finish("test_preview");

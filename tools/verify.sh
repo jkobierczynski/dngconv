@@ -24,6 +24,8 @@
 #   metadata     compare_metadata.py              (ExifTool, Python) report only, see metadata.txt
 #   lens         compare_camera_jpeg.py           (dng_validate, Python) corrected geometry matches
 #                                                 the camera's JPEG, for files with a distortion opcode
+#   preview      dngconv --preview render,        (ExifTool, Python) every rendered preview decodes and
+#                compare_preview.py               has the geometry of the camera's JPEG
 #   profiles     dngconv --profile, compare_profile.py   (Python; only with PROFILES set) every
 #                                                 embedded camera profile equals its .dcp file
 #
@@ -259,6 +261,35 @@ if [ "$have_python" = yes ] && [ "$have_exiftool" = yes ] && [ -n "$validator" ]
     fi
 else
     skipped lens "needs dng_validate, ExifTool and Python with opencv"
+fi
+
+# ---- rendered previews -----------------------------------------------------------
+if [ "$have_python" = yes ] && [ "$have_exiftool" = yes ]; then
+    "$dngconv" --preview render -r -q -o "$work/rendered" "$raws" >"$work/preview.err" 2>&1
+    : >"$work/preview.log"
+    good=0
+    bad=0
+    alone=0
+    grep ' -> ' "$work/convert.log" >"$work/preview.list" || true
+    while IFS= read -r line; do
+        source=${line%% -> *}
+        rest=${line#* -> }
+        dng=${rest%%  (*}
+        rendered="$work/rendered${dng#"$work/dng"}"
+        "$python" "$here/compare_preview.py" "$source" "$rendered" >>"$work/preview.log" 2>&1
+        case $? in
+            0) good=$((good + 1)) ;;
+            2) alone=$((alone + 1)) ;;
+            *) bad=$((bad + 1)) ;;
+        esac
+    done <"$work/preview.list"
+    if [ "$bad" -eq 0 ] && [ $((good + alone)) -gt 0 ]; then
+        passed preview "$good rendered previews have the geometry of their camera JPEG; $alone more decode but have nothing to be compared with (tones: see preview.log)"
+    else
+        failed preview "$bad of $((good + bad + alone)) previews; see $work/preview.log"
+    fi
+else
+    skipped preview "needs ExifTool and Python with opencv"
 fi
 
 # ---- camera profiles -------------------------------------------------------------

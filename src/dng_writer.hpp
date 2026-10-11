@@ -23,6 +23,15 @@ enum class DngCompression {
     LosslessJpeg,  // lossless JPEG in tiles
 };
 
+enum class DngPreview {
+    // The camera's own JPEG when the source has one of a useful size,
+    // otherwise a picture rendered from the raw data.
+    Auto,
+    Camera,  // the camera's JPEG, or no preview
+    Render,  // always rendered from the raw data
+    None,
+};
+
 enum class DngByteOrder {
     // Big-endian when a maker note from a big-endian source is carried over,
     // little-endian otherwise. Some maker notes (Nikon's, for one) contain
@@ -43,8 +52,13 @@ struct DngWriteOptions {
     /// Render a small RGB thumbnail from the raw data and store it in the
     /// first image directory, where file browsers look for it.
     bool embedThumbnail = true;
-    /// Store the source file's JPEG preview, when the RawImage carries one.
-    bool embedPreview = true;
+    /// The JPEG preview stored next to the raw image.
+    DngPreview preview = DngPreview::Auto;
+    /// Longest edge of a rendered preview, in pixels; 0 = as large as the
+    /// renderer can make it (half the sensor's width, a third for X-Trans).
+    uint32_t previewSize = 1024;
+    /// JPEG quality of a rendered preview, 1..100.
+    int previewQuality = 90;
     /// Write NewRawImageDigest and RawDataUniqueID.
     bool digests = true;
     /// Store RawImage::originalFile, when it is not empty, so the source file
@@ -74,6 +88,14 @@ struct DngWriteOptions {
 /// areas inside the frame). Throws std::invalid_argument describing the first
 /// problem found.
 void validate(const RawImage& image);
+
+/// What writeDng() will store as the preview of an image.
+struct PreviewPlan {
+    enum class Kind { None, Camera, Rendered } kind = Kind::None;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+PreviewPlan planPreview(const RawImage& image, const DngWriteOptions& options);
 
 /// Writes the DNG to a stream. Throws on invalid input or write failure.
 void writeDng(const RawImage& image, std::ostream& out, const DngWriteOptions& options = {});

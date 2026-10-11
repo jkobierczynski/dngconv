@@ -573,7 +573,7 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
     }
 
     // ---- embedded preview ---------------------------------------------------
-    if (options.loadPreview && !options.metadataOnly) {
+    if (options.loadPreview) {
         if (lr.unpack_thumb() == LIBRAW_SUCCESS &&
             d.thumbnail.tformat == LIBRAW_THUMBNAIL_JPEG && d.thumbnail.thumb &&
             d.thumbnail.tlength > 4) {

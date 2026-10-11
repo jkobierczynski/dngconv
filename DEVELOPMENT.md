@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.7.0.
+Last updated: 2026-10-11, at version 0.8.0.
 
 ## Status at a glance
 
@@ -18,7 +18,7 @@ Last updated: 2026-10-11, at version 0.7.0.
 | Camera profiles (`--profile`) | Working: DCP files embedded as main and extra profiles; identical renders to an ExifTool-made reference in Adobe's code |
 | EXIF and GPS copy | Working for TIFF-based raws, CR3, RAF, RW2 |
 | Maker notes | Copied, stored twice; verified with ExifTool and exiv2 |
-| Previews | Standard layout: rendered thumbnail in IFD0, raw image and camera JPEG in sub-directories |
+| Previews | Standard layout: rendered thumbnail in IFD0, raw image and a JPEG preview in sub-directories. The preview is the camera's, or rendered here (own renderer and JPEG encoder) when there is none or on request |
 | Digests | `NewRawImageDigest` and `RawDataUniqueID`; the former confirmed by Adobe's validator |
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
@@ -407,6 +407,63 @@ Decisions:
   profiles is not written (LibRaw has no such table), which the README
   states.
 
+### 0.8.0 (2026-10-11): rendered previews
+
+1. **`--preview auto|camera|render|none`** and **`--preview-size <n|max>`**.
+   Automatic keeps the camera's JPEG when it is at least 1000 pixels long
+   and renders one otherwise; `--no-preview` stays as another word for
+   `none`.
+2. **The renderer** (`render.*`, grown out of `thumbnail.*`) makes pictures
+   of any size up to one pixel per mosaic block: cell averages, an area
+   filter down to the size asked for, lens corrections, a tone curve, all
+   on a few threads. The thumbnail is the same picture at 256 pixels.
+3. **A baseline JPEG encoder** (`jpeg_encoder.*`): 4:2:0, quantisation
+   tables of the standard scaled the usual way, Huffman tables computed per
+   picture and limited to 16 bits.
+4. The preview directory of a rendered preview names its maker
+   (`PreviewApplicationName`, `PreviewApplicationVersion`) and its colour
+   space (`PreviewColorSpace` = sRGB). `-i` says which preview a file gets.
+   `check` now counts extra camera profiles when it works out whether a
+   file is complete. `tools/compare_preview.py`, and a `preview` step in
+   `verify.sh`.
+
+Findings:
+
+| Finding | Resolution |
+|---|---|
+| The thumbnail renderer of 0.3.0 brightened every picture until its brightest percent was white, by up to two stops. Measured against the cameras' JPEGs this is wrong for ordinary pictures: their brightest percent mostly sits at 14 to 65 % of the sensor's range, by the cameras' own choice, and the JPEGs are that dark there too. | Automatic exposure removed. Exposure is as shot. |
+| What cameras do instead is a tone curve. Measured on thirteen cameras (near-neutral 16-pixel cells of the camera's JPEG against the renderer's linear output): mid-tones about twice as bright as the linear value (0.12 becomes 0.28), highlights compressed, values below 0.02 darker than linear. Cameras differ by a factor of 2.5 at a linear value of 0.06 (Fujifilm S5500 lowest, Olympus E-M10 highest). | One curve for all, close to the median: `x (1 + a) / (1 + a x)` with a = 1.5, times a toe `(x^2 + f s^2) / (x^2 + s^2)` with s = 0.025 and f = 0.3. The toe is gentler than the cameras' so that shadows stay readable. |
+| X-Trans repeats every six pixels, and the first version used that period as its cell, giving previews a sixth of the sensor wide. | Every 3 x 3 block of the pattern already holds five green, two red and two blue samples. The renderer now looks for the smallest block that is balanced wherever it lies on its own grid, and aligns its cells with that grid. |
+| A Huffman tree for symbol frequencies in exact Fibonacci proportion is ambiguous: every merge is a tie, and this encoder's tie-breaking happens to give a bushy tree of depth 12. The test meant to exercise the 16-bit limit did not. | The test's frequencies grow by one more than Fibonacci's, which leaves no ties and gives a chain 20 deep; the limit is reached and the picture decodes. |
+| A JPEG strip of odd length is followed by a padding byte, so "the last 100 bytes missing" reads as 99 for some files. | `check`'s message was right; its test now accepts both. |
+| After a change to an options structure the scratch program linking the library showed pictures 15 dB off: it had been compiled against the old layout. | Not a bug in the converter; noted because the first reading was "the encoder is broken". |
+
+How it was verified:
+
+| Check | Result |
+|---|---|
+| The encoder against libjpeg (Pillow, quality 90, 4:2:0, optimised tables) on five previews | Same error to 0.01 dB (one file 0.05 dB better); 0.5 to 4 % smaller |
+| Decoders | libjpeg through Pillow and OpenCV give the same pixels; the unit tests' own decoder (separate zigzag table, Huffman decoding from the file's tables, plain inverse DCT) reads every test picture, including noise at quality 100 and the 20-deep code tree |
+| Rendered preview against the camera's JPEG, 12 files (a thirteenth, a night sky, cannot be matched) | Median residual of matched points 0.18 to 0.53 preview pixels; with the lens corrections off 4.0 (Panasonic) and 1.4 (Olympus) |
+| Tones against the camera's JPEG | Median brightness within 18 of 255; typical difference per cell 1 to 18 |
+| Adobe `dng_validate`, ExifTool `-validate`, exiv2 | No error on 15 DNGs with rendered previews at 1024 pixels and four at the largest size; exiv2 lists thumbnail and preview |
+| Sanitizers | ASan/UBSan and TSan clean on the tests and on conversions with `--preview render` |
+
+Decisions:
+
+- **Averages over mosaic blocks, no demosaicing.** A real demosaicer for
+  Bayer and another for X-Trans would be most of a raw developer. Half
+  resolution is ample for a preview, and block averages have no artefacts
+  to argue about.
+- **One curve, exposure as shot.** A per-camera curve would need a table
+  nobody has; matching each rendered preview to the camera's JPEG is
+  possible only where there is one, which is where rendering is needed
+  least.
+- **Huffman tables per picture.** Slightly smaller files, and no table to
+  copy from the standard but the two quantisation ones.
+- **No time stamp in the preview directory** (`PreviewDateTime`): two
+  conversions of the same file stay byte-identical.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -536,7 +593,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (11 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
+| Unit tests (12 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -548,6 +605,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
+| Rendered previews | libjpeg (Pillow, OpenCV), OpenCV SIFT matching against the camera's JPEG | The encoder writes what libjpeg would; the rendered picture has the camera's geometry and, within the spread between cameras, its tones; see the 0.8.0 history |
 | Camera profiles | ExifTool (tag values, and as the writer of a reference DNG), Adobe `dng_validate` (parsing, rendering, rewriting) | The embedded profile is the `.dcp` file's, and is developed as such; see the 0.7.0 history |
 | Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
 | Threads | GCC 13 thread sanitizer | Parallel conversion, checking and extraction of all samples, and the unit tests, with LibRaw's own OpenMP threads excluded |
@@ -580,6 +638,8 @@ Not covered by any check so far:
   Adobe-made DNG with an embedded original was at hand.
 - Originals of 4 GiB or more (refused), and memory use on very large files:
   the source file and its packed copy are both held in memory.
+- Rendered previews in the programs they are meant for: no file browser
+  or photo manager on any system has been shown one.
 - Camera profiles in Lightroom's and Camera Raw's menus, Adobe's own
   profiles (none at hand), profiles with three illuminants or the DNG 1.7
   tables (accepted and carried, never met in a real file).

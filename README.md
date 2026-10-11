@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.7.0, early**. It works on the cameras listed under
+Status: **0.8.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -32,7 +32,9 @@ Status: **0.7.0, early**. It works on the cameras listed under
   the camera's own JPEG is. See [Lens corrections](#lens-corrections).
 - Previews in the standard DNG arrangement: a small thumbnail rendered from
   the raw data in the first image directory, where file browsers look, and
-  the camera's own full-size JPEG as a second preview.
+  a JPEG preview next to it. That is the camera's own JPEG where the file
+  has one; where it has none, or on request, dngconv **renders the preview
+  itself**, at a size you choose. See [Previews](#previews).
 - Fingerprints (`NewRawImageDigest`, `RawDataUniqueID`), so a reader can
   detect damaged raw data and recognise the same exposure again.
 - Optionally stores the **original camera file** inside the DNG
@@ -97,13 +99,19 @@ dngconv --verify -o safe.dng shot.ARW # convert, then prove nothing was lost
 dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
 dngconv --lens-corrections none *.ARW # leave the lens corrections out
 dngconv --profile ~/profiles *.CR3    # embed the camera profiles that fit
+dngconv --preview render --preview-size 2048 *.NEF   # previews made here
 dngconv -i shot.RAF                   # show what the decoder finds
 ```
 
 ```
   -o, --output <path>       output file (one input) or output folder
   -c, --compression <mode>  lossless (default) or none
-      --no-preview          do not copy the embedded JPEG preview
+      --preview <which>     the JPEG preview in the DNG: auto (default; the
+                            camera's own, or one rendered from the raw data
+                            if the file has none), camera, render, or none
+      --preview-size <n>    longest edge of a rendered preview in pixels
+                            (default 1024), or max for the largest possible
+      --no-preview          the same as --preview none
       --no-maker-notes      do not copy the camera maker's private metadata
   -e, --embed-original      store the source file inside the DNG, so that
                             'dngconv extract' can restore it later
@@ -270,7 +278,7 @@ What it covers, and what it cannot:
 
 ## What has been tested
 
-Each file below was converted and then checked in up to eight ways:
+Each file below was converted and then checked in up to nine ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -304,6 +312,10 @@ Each file below was converted and then checked in up to eight ways:
    a reference in which ExifTool wrote the same profile. See
    [Camera profiles](#camera-profiles).
 
+9. **Rendered previews**: converted with `--preview render`, the preview
+   was decoded with libjpeg and laid over the camera's own JPEG of the same
+   shot. See [Previews](#previews).
+
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
 | Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | none, see "What LibRaw decides" |
@@ -311,7 +323,7 @@ Each file below was converted and then checked in up to eight ways:
 | Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.0 MB | none |
 | Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 19.3 MB | none |
 | Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 5.8 MB | none |
-| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.6 MB | none |
+| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.7 MB | none |
 | Nikon D3S | NEF | Bayer | 10.2 MB | 9.3 MB | none |
 | Nikon D4 | NEF | Bayer | 16.4 MB | 15.3 MB | none |
 | Olympus E-M10 | ORF | Bayer | 13.8 MB | 15.9 MB | none |
@@ -512,11 +524,84 @@ Raw are built, applies opcodes whenever it renders a file. darktable (tried
 with 4.6) offers them in its lens correction module under "embedded
 metadata". Programs built on LibRaw, and RawTherapee 5.10, ignore them and
 show the picture uncorrected, as they would the original raw file. The
-thumbnail in the DNG is rendered without the corrections.
+thumbnail and a preview rendered by dngconv have distortion and vignetting
+corrected, so they show the picture as a reader of the opcodes will.
 
 **Accuracy of the conversion.** The cameras use tables and formulas of their
 own; DNG wants polynomials. The fit is reported for every file (`-i`, see
 above) and stayed below 0.4 pixels and 0.5 % brightness on the samples.
+
+## Previews
+
+A DNG carries ready-made pictures for programs that do not develop raw data:
+file browsers, photo managers, the quick look of an operating system.
+dngconv writes two. One is a thumbnail of 256 pixels in the first image
+directory. The other is a JPEG preview:
+
+| `--preview` | The preview is |
+|---|---|
+| `auto` (default) | the camera's own JPEG, taken from the raw file unchanged. If the file has none, or only one smaller than 1000 pixels, a preview is rendered from the raw data instead |
+| `camera` | the camera's JPEG, whatever its size, or none |
+| `render` | always rendered from the raw data |
+| `none` | left out (`--no-preview` says the same); the thumbnail stays |
+
+`--preview-size` sets the longest edge of a rendered preview, 1024 pixels
+unless told otherwise; `max` asks for the largest the renderer can make.
+`-i` tells which of the two a file would get, and the line printed for each
+conversion says so when a preview was rendered.
+
+**Why render at all.** Early digital cameras and some current ones store no
+JPEG in their raw files, or one of 160 pixels. Previews from different
+cameras come in every size from 1280 to 7360 pixels wide, which matters
+when thousands of files are archived: `--preview render` gives all of them
+the same modest preview and the file size that goes with it (the Samsung
+sample shrinks from 25.4 to 18.2 MB). And a rendered preview shows what is
+in the DNG, lens corrections included, not what the camera's settings made
+of the shot.
+
+**How it is done.** The thumbnail and the rendered preview come from the
+same code, and it is a quick look, not a development:
+
+- Every pixel is the average of a whole number of the mosaic's smallest
+  blocks (2 x 2 sensor pixels on a Bayer sensor, 3 x 3 on X-Trans) instead
+  of a demosaiced value. A preview can therefore be at most half as wide as
+  the sensor, a third for X-Trans; full-colour raws (Canon sRAW) go up to
+  full size. In return there are no demosaicing artefacts, and noise
+  averages out.
+- Colour comes from the decoder's matrix and the as-shot white balance;
+  clipped highlights turn white.
+- Exposure is left as shot. One tone curve serves all cameras: mid-tones
+  about a stop up, shadows held down. It was fitted to the JPEGs of the
+  thirteen sample cameras that have one, and is their median; a particular
+  camera can differ from it by up to a stop in the mid-tones.
+- Distortion and vignetting are corrected with the same polynomials the
+  DNG's opcodes hold.
+- No sharpening, no noise reduction, no highlight recovery, and not the
+  camera profile given with `--profile`.
+
+The JPEG is baseline, 8 bits, colour at half resolution (4:2:0), quality 90,
+written by dngconv's own encoder with Huffman tables made for each picture.
+At 1024 pixels a preview is 60 to 260 KB; at `max` the 24-megapixel Canon
+sample gets one of 2997 x 1997 pixels and 2.6 MB. Rendering takes less than
+a tenth of a second per file.
+
+**How it compares with the camera's JPEG.** For twelve samples
+`tools/compare_preview.py` matched points between the two pictures and
+compared tones over a grid (a thirteenth, a night sky, has too little in it
+to match):
+
+| | Result |
+|---|---|
+| Geometry, all twelve | median distance between matched points 0.2 to 0.5 preview pixels |
+| The four files with a distortion opcode | 0.25 to 0.31 pixels, no trend from centre to corner |
+| The same without lens corrections | Panasonic: 4.0 pixels, 17 in the corner; Olympus: 1.4 and 3 |
+| Median brightness, of 255 | equal for the Canon EOS R8; within 18 for all (Fujifilm S5500 and Samsung brighter than their camera's JPEG, Fujifilm X-E1 and Olympus darker) |
+| Typical difference per grid cell | 1 to 18 in brightness, 2 to 8 in colour |
+
+The encoder was held against libjpeg at the same settings on five of the
+previews: the same error to a few hundredths of a decibel, files 0.4 to 4 %
+smaller. Its output is read by libjpeg (through Pillow and OpenCV), by
+ExifTool and exiv2, and by a decoder written for the unit tests.
 
 ## Camera profiles
 
@@ -593,7 +678,8 @@ without ExifTool.
 - Software built on LibRaw or rawspeed (darktable, RawTherapee) reads the
   matrices and ignores tables and curves in a DNG. RawTherapee can load the
   `.dcp` file itself.
-- The thumbnail is rendered with the decoder's matrix, as before.
+- The thumbnail, and a preview rendered by dngconv, use the decoder's
+  matrix, as before.
 - Profiles add their size to every file: from a few kilobytes for matrices
   alone to about a megabyte with a look table. Ten of the latter are 10 MB
   per picture.
@@ -606,13 +692,14 @@ opcode (`FixBadPixelsConstant`) asking the reader to interpolate over them.
 Readers that implement opcodes repair them; readers that do not (LibRaw-based
 ones, for instance) show them as dark dots.
 
-**Thumbnail.** The 256-pixel thumbnail is a quick rendering of the raw data:
-block averages instead of demosaicing, the colour matrix, as-shot white
-balance, and automatic brightening by at most two stops. It follows the
-default crop and, like the raw data, relies on the `Orientation` tag for
-rotation. It will not match the camera's JPEG exactly; that one is stored next
-to it, unchanged. `--no-preview` leaves out the camera's JPEG but keeps the
-thumbnail.
+**Thumbnail.** The 256-pixel thumbnail is a quick rendering of the raw data,
+made like a rendered preview (see [Previews](#previews)): block averages
+instead of demosaicing, the colour matrix, as-shot white balance, a tone
+curve like a camera's, the lens corrections. It follows the default crop
+and, like the raw data and the previews, relies on the `Orientation` tag
+for rotation. `--preview none` leaves out the JPEG preview but keeps the
+thumbnail. Up to version 0.7 thumbnails had no tone curve and were
+brightened automatically instead; they now keep the exposure of the shot.
 
 **Default crop.** When the source says which part of the sensor is the
 picture, that becomes the default crop. Otherwise the whole active area is
@@ -670,8 +757,8 @@ newer LibRaw.
 - A second calibration illuminant of dngconv's own (a profile given with
   `--profile` brings its own), DNG 1.6/1.7 features (JPEG XL compression
   among them).
-- A JPEG preview for cameras whose files carry none (only the thumbnail is
-  written then), and re-rendering previews at a chosen size.
+- Rendered previews at the sensor's full resolution (that needs
+  demosaicing), or developed with an embedded camera profile.
 
 ## How the source is organised
 
@@ -687,7 +774,8 @@ newer LibRaw.
 | `src/lens_data.*` | Reads each maker's lens-correction parameters into those curves |
 | `src/lens_opcodes.*` | Fits the curves to DNG's polynomials and builds the opcode list |
 | `src/camera_profile.*` | Reads camera profiles (`.dcp`), picks those that fit a camera, packs them for the DNG |
-| `src/thumbnail.*` | Renders the small RGB thumbnail from the raw data |
+| `src/render.*` | Renders an sRGB picture from the raw data, for the thumbnail and for previews |
+| `src/jpeg_encoder.*` | Baseline JPEG encoder for rendered previews |
 | `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/dng_digest.*` | The two raw image digests DNG defines |
@@ -697,7 +785,7 @@ newer LibRaw.
 | `src/sidecar.*` | Finds and reads XMP sidecar files |
 | `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

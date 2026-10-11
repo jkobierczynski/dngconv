@@ -407,8 +407,8 @@ int main(int argc, char** argv) {
         CHECK(ifd0.at(51111).data != ifd0.at(50781).data);
         CHECK(ifd0.count(33422) == 0 && ifd0.count(50829) == 0);        // raw tags are not here
 
-        // SubIFD 0: the raw image.
-        CHECK(ifd0.at(330).count == 1);
+        // SubIFD 0: the raw image. (SubIFD 1 is the preview rendered for it.)
+        CHECK(ifd0.at(330).count == 2);
         const tiffreader::Ifd rawIfd = tiffreader::parseIfd(bytes, ifd0.at(330).u32());
         CHECK(rawIfd.at(254).u32() == 0);                 // full-resolution image
         CHECK(rawIfd.at(262).u16() == 32803);             // colour filter array
@@ -479,8 +479,12 @@ int main(int argc, char** argv) {
         CHECK(shifted.at(51008).data.at(27) == 1);
 
         // With a camera preview there are two sub-directories: raw, then JPEG.
+        // (The test's JPEG is a few pixels small, so it has to be asked for:
+        // left to itself the writer would render a larger preview instead.)
         const RawImage& withJpeg = cases.back().image;
-        writeDng(withJpeg, file);
+        DngWriteOptions cameraPreview;
+        cameraPreview.preview = DngPreview::Camera;
+        writeDng(withJpeg, file, cameraPreview);
         const std::string previewBytes = tiffreader::slurp(file);
         const tiffreader::Ifd p0 = tiffreader::parseFirstIfd(previewBytes);
         CHECK(p0.at(254).u32() == 1 && p0.at(262).u16() == 2);   // still the RGB thumbnail
@@ -504,6 +508,7 @@ int main(int argc, char** argv) {
         // The older layouts remain available: JPEG preview in IFD0 without a
         // thumbnail, and the raw image itself in IFD0 with neither.
         DngWriteOptions noThumbnail;
+        noThumbnail.preview = DngPreview::Camera;
         noThumbnail.embedThumbnail = false;
         writeDng(withJpeg, file, noThumbnail);
         const std::string jpegFirst = tiffreader::slurp(file);
@@ -511,7 +516,7 @@ int main(int argc, char** argv) {
         CHECK(j0.at(259).u16() == 7 && j0.at(262).u16() == 6 && j0.at(330).count == 1);
         CHECK(tiffreader::parseIfd(jpegFirst, j0.at(330).u32()).at(254).u32() == 0);
 
-        noThumbnail.embedPreview = false;
+        noThumbnail.preview = DngPreview::None;
         noThumbnail.digests = false;
         writeDng(withJpeg, file, noThumbnail);
         const tiffreader::Ifd bare0 = tiffreader::parseFirstIfd(tiffreader::slurp(file));

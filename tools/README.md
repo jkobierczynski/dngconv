@@ -28,6 +28,7 @@ there is a tool for:
   ok       render    14 pairs develop to the same picture (notes: 2, ...; see render.log)
   ok       metadata  report written to .../metadata.txt (for reading; nothing is judged)
   ok       lens      4 files with a distortion opcode match their camera JPEG (see lens.log)
+  ok       preview   12 rendered previews have the geometry of their camera JPEG; 3 more decode ...
   ok       profiles  9 DNGs carry the profiles made for their camera, value for value (...)
 
 all steps that ran passed
@@ -51,6 +52,7 @@ is 0 if no step that ran failed.
 | render | Source and DNG develop to the same picture: pattern, levels, white balance and matrix are described correctly | Python, rawpy |
 | metadata | A report of which tags survive, for reading | ExifTool, Python |
 | lens | The DNG, developed with its lens opcodes, has the geometry of the camera's own JPEG | `dng_validate`, ExifTool, Python, OpenCV |
+| preview | Converted again with `--preview render`, every preview decodes as a JPEG and, where the raw file holds a camera JPEG, has its geometry | ExifTool, Python, OpenCV |
 | profiles | Converted again with `--profile`, each DNG holds the profiles of its camera exactly as the `.dcp` files have them, and Adobe's reader parses them. Runs only when `PROFILES` names a folder of profiles | Python; `dng_validate` if present |
 
 Environment variables: `DNGCONV` (the program under test; default
@@ -132,6 +134,13 @@ it what the DNG's opcode will remove. It needs a detailed picture taken at
 low ISO.
 
 **`matching.py`** is the point matching the two lens scripts share.
+
+**`compare_preview.py RAW_FILE DNG_FILE`** is for DNGs converted with
+`--preview render`. It takes the preview out of the DNG, decodes it, and
+compares it with the camera's own JPEG from the raw file: matched points for
+the geometry (which includes the lens corrections applied to the preview),
+brightness and colour over a grid for the tones. Geometry is judged; tones
+are reported, because every camera has its own.
 
 **`compare_profile.py PROFILE_FOLDER DNG_FILE...`** reads the camera profile
 tags of each DNG, and each of its extra profile blocks, with a few lines of

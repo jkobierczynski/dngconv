@@ -254,6 +254,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- preview options --------------------------------------------------------------------
+    {
+        const std::string missing = quoted(gDir / "no-such-file.raw");
+        Run r = run("--preview sideways " + missing);
+        CHECK(r.status == 2 && contains(r.err, "auto, camera, render or none"));
+        r = run("--preview-size 10 " + missing);
+        CHECK(r.status == 2 && contains(r.err, "64 to 65535"));
+        r = run("--preview-size large " + missing);
+        CHECK(r.status == 2);
+        // Accepted: the run then fails on the file that is not there.
+        for (const char* options : {"--preview render --preview-size max", "--preview camera", "--preview auto --preview-size 2048",
+                                    "--preview none", "--no-preview"}) {
+            r = run(std::string(options) + " " + missing);
+            CHECK(r.status == 1 && contains(r.err, "no such file"));
+        }
+    }
+
     // ---- camera profiles: described with -i, refused when unusable --------------------------
     {
         namespace tb = tiffbuilder;

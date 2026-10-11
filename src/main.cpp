@@ -43,7 +43,8 @@ struct Settings {
     std::vector<std::string> inputs;
     std::string output;
     DngCompression compression = DngCompression::LosslessJpeg;
-    bool preview = true;
+    DngPreview preview = DngPreview::Auto;
+    uint32_t previewSize = 1024;  // longest edge of a rendered preview; 0 = largest
     bool makerNotes = true;
     bool embedOriginal = false;
     LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
@@ -81,7 +82,12 @@ const char* const kUsage =
     "  -o, --output <path>       output file (one input) or output folder\n"
     "                            (default: next to each source file)\n"
     "  -c, --compression <mode>  lossless (default) or none\n"
-    "      --no-preview          do not copy the embedded JPEG preview\n"
+    "      --preview <which>     the JPEG preview in the DNG: auto (default; the\n"
+    "                            camera's own, or one rendered from the raw data\n"
+    "                            if the file has none), camera, render, or none\n"
+    "      --preview-size <n>    longest edge of a rendered preview in pixels\n"
+    "                            (default 1024), or max for the largest possible\n"
+    "      --no-preview          the same as --preview none\n"
     "      --no-maker-notes      do not copy the camera maker's private metadata\n"
     "  -e, --embed-original      store the source file inside the DNG, so that\n"
     "                            'dngconv extract' can restore it later\n"
@@ -306,7 +312,39 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
         } else if (a == "-t" || a == "--keep-times") {
             s.keepTimes = true;
         } else if (a == "--no-preview") {
-            s.preview = false;
+            s.preview = DngPreview::None;
+        } else if (a == "--preview") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            if (*v == "auto") {
+                s.preview = DngPreview::Auto;
+            } else if (*v == "camera") {
+                s.preview = DngPreview::Camera;
+            } else if (*v == "render") {
+                s.preview = DngPreview::Render;
+            } else if (*v == "none") {
+                s.preview = DngPreview::None;
+            } else {
+                std::fprintf(stderr,
+                             "dngconv: unknown choice '%s' for --preview (use auto, camera, "
+                             "render or none)\n",
+                             v->c_str());
+                return false;
+            }
+        } else if (a == "--preview-size") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            char* end = nullptr;
+            const long n = std::strtol(v->c_str(), &end, 10);
+            if (*v == "max") {
+                s.previewSize = 0;
+            } else if (v->empty() || !end || *end || n < 64 || n > 65535) {
+                std::fprintf(stderr, "dngconv: --preview-size needs a number of pixels from 64 to "
+                                     "65535, or max\n");
+                return false;
+            } else {
+                s.previewSize = static_cast<uint32_t>(n);
+            }
         } else if (a == "--no-maker-notes") {
             s.makerNotes = false;
         } else if (a == "-e" || a == "--embed-original") {
@@ -504,6 +542,22 @@ void printInfo(const fs::path& path, const RawReadResult& r, const Settings& set
         else
             std::printf("  corrections   none would be written\n");
         for (const auto& note : opcodes.notes) std::printf("  note          %s\n", note.c_str());
+    }
+    {
+        DngWriteOptions wo;
+        wo.preview = settings.preview;
+        wo.previewSize = settings.previewSize;
+        const PreviewPlan plan = planPreview(img, wo);
+        if (plan.kind == PreviewPlan::Kind::Camera)
+            std::printf("  preview       the camera's JPEG, %u x %u\n", plan.width, plan.height);
+        else if (plan.kind == PreviewPlan::Kind::Rendered && settings.preview == DngPreview::Render)
+            std::printf("  preview       to be rendered from the raw data, %u x %u\n", plan.width, plan.height);
+        else if (plan.kind == PreviewPlan::Kind::Rendered)
+            std::printf("  preview       %s; one of %u x %u would be rendered from the raw data\n",
+                        img.previewJpeg.empty() ? "none in the file" : "only a small one in the file",
+                        plan.width, plan.height);
+        else
+            std::printf("  preview       none\n");
     }
     if (!img.xmpSidecarName.empty())
         std::printf("  sidecar       %s (%zu bytes of XMP)\n", img.xmpSidecarName.c_str(), img.xmpSidecar.size());
@@ -933,7 +987,7 @@ int main(int argc, char** argv) {
                 }
                 RawReadOptions ro;
                 ro.metadataOnly = true;
-                ro.loadPreview = false;
+                ro.loadPreview = settings.preview == DngPreview::Auto || settings.preview == DngPreview::Camera;
                 printInfo(job.input, readRaw(job.input, ro), settings, library);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "dngconv: %s: %s\n", show(job.input).c_str(), e.what());
@@ -976,7 +1030,8 @@ int main(int argc, char** argv) {
     DngWriteOptions writeOptions;
     writeOptions.compression = settings.compression;
     writeOptions.threads = plan.perFile;
-    writeOptions.embedPreview = settings.preview;
+    writeOptions.preview = settings.preview;
+    writeOptions.previewSize = settings.previewSize;
     writeOptions.makerNotes = settings.makerNotes;
     writeOptions.lensCorrections = settings.lensCorrections;
     writeOptions.xmpSidecar = settings.sidecar;
@@ -1027,7 +1082,7 @@ int main(int argc, char** argv) {
 
             const auto started = std::chrono::steady_clock::now();
             RawReadOptions ro;
-            ro.loadPreview = settings.preview;
+            ro.loadPreview = settings.preview == DngPreview::Auto || settings.preview == DngPreview::Camera;
             ro.keepOriginalFile = settings.embedOriginal;
             ro.readSidecar = settings.sidecar;
             RawReadResult source = readRaw(job.input, ro);
@@ -1051,6 +1106,10 @@ int main(int argc, char** argv) {
                                library.size(), library.size() == 1 ? "" : "s",
                                source.image.uniqueCameraModel.c_str()));
             }
+            const PreviewPlan previewPlan = planPreview(source.image, options);
+            std::string previewNote;
+            if (previewPlan.kind == PreviewPlan::Kind::Rendered)
+                previewNote = format(", preview rendered at %u x %u", previewPlan.width, previewPlan.height);
             std::string profileNote;
             if (!options.profiles.empty()) {
                 profileNote = ", profile: " + options.profiles.front()->displayName();
@@ -1075,11 +1134,11 @@ int main(int argc, char** argv) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
                 const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
-                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s)\n", name.c_str(),
+                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s)\n", name.c_str(),
                                     show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                                     megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
                                     lens.any() ? ", lens: " : "", lens.summary().c_str(),
-                                    profileNote.c_str(),
+                                    profileNote.c_str(), previewNote.c_str(),
                                     sidecar ? ", with " : "",
                                     sidecar ? source.image.xmpSidecarName.c_str() : "",
                                     settings.verify ? (settings.embedOriginal

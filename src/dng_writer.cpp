@@ -19,7 +19,8 @@
 #include "md5.hpp"
 #include "original_raw.hpp"
 #include "parallel.hpp"
-#include "thumbnail.hpp"
+#include "jpeg_encoder.hpp"
+#include "render.hpp"
 #include "tiff_writer.hpp"
 
 namespace dngconv {
@@ -85,6 +86,9 @@ constexpr uint16_t OpcodeList1 = 51008;
 constexpr uint16_t XMP = 700;
 constexpr uint16_t OpcodeList3 = 51022;
 constexpr uint16_t NewRawImageDigest = 51111;
+constexpr uint16_t PreviewApplicationName = 50966;
+constexpr uint16_t PreviewApplicationVersion = 50967;
+constexpr uint16_t PreviewColorSpace = 50970;
 // EXIF IFD
 constexpr uint16_t ExposureTime = 33434;
 constexpr uint16_t FNumber = 33437;
@@ -350,7 +354,37 @@ bool allIntegers(const std::vector<double>& v) {
     });
 }
 
+// A camera JPEG smaller than this (longest edge) is a thumbnail, not a preview.
+constexpr uint32_t kUsefulPreview = 1000;
+
 }  // namespace
+
+PreviewPlan planPreview(const RawImage& img, const DngWriteOptions& options) {
+    PreviewPlan plan;
+    if (options.preview == DngPreview::None) return plan;
+
+    JpegInfo camera;
+    const bool haveCamera = options.preview != DngPreview::Render && !img.previewJpeg.empty() &&
+                            parseJpeg(img.previewJpeg, camera);
+    uint32_t rw = 0, rh = 0;
+    const bool canRender = options.preview != DngPreview::Camera &&
+                           renderedSize(img, options.previewSize, rw, rh);
+    const uint32_t cameraEdge = std::max(camera.width, camera.height);
+    // Automatic: the camera's picture, unless it is a mere thumbnail and
+    // rendering gives a larger one.
+    const bool useCamera = haveCamera && (!canRender || cameraEdge >= kUsefulPreview ||
+                                          cameraEdge >= std::max(rw, rh));
+    if (useCamera) {
+        plan.kind = PreviewPlan::Kind::Camera;
+        plan.width = camera.width;
+        plan.height = camera.height;
+    } else if (canRender) {
+        plan.kind = PreviewPlan::Kind::Rendered;
+        plan.width = rw;
+        plan.height = rh;
+    }
+    return plan;
+}
 
 void validate(const RawImage& img) {
     auto fail = [](const char* what) { throw std::invalid_argument(std::string("raw image: ") + what); };
@@ -411,12 +445,32 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     TiffWriter tiff;
     TiffIfd& ifd0 = tiff.addIfd();
 
-    JpegInfo preview;
-    const bool withPreview =
-        options.embedPreview && !img.previewJpeg.empty() && parseJpeg(img.previewJpeg, preview);
+    // The lens corrections the DNG will carry; the pictures rendered here
+    // get them applied, as a reader of the DNG will apply them.
+    const LensOpcodes lensOpcodes = makeLensOpcodes(img, options.lensCorrections);
+
+    RenderOptions render;
+    render.lens = &lensOpcodes;
+    render.threads = options.threads;
     RgbImage thumbnail;
-    if (options.embedThumbnail) thumbnail = renderThumbnail(img);
+    if (options.embedThumbnail) thumbnail = renderPicture(img, render);
     const bool withThumbnail = !thumbnail.pixels.empty();
+
+    // The preview: the camera's JPEG as it is, or one made here.
+    const PreviewPlan previewPlan = planPreview(img, options);
+    std::vector<uint8_t> renderedJpeg;
+    if (previewPlan.kind == PreviewPlan::Kind::Rendered) {
+        render.maxSize = options.previewSize;
+        const RgbImage picture = renderPicture(img, render);
+        if (!picture.pixels.empty())
+            renderedJpeg = encodeJpeg(picture.pixels.data(), picture.width, picture.height,
+                                      options.previewQuality, options.threads);
+    }
+    const bool renderedPreview = !renderedJpeg.empty();
+    const std::vector<uint8_t>& previewJpeg = renderedPreview ? renderedJpeg : img.previewJpeg;
+    JpegInfo preview;
+    const bool withPreview = (renderedPreview || previewPlan.kind == PreviewPlan::Kind::Camera) &&
+                             parseJpeg(previewJpeg, preview);
 
     // The layout Adobe's converter uses and file browsers expect:
     //   IFD0       small uncompressed thumbnail, plus all camera metadata
@@ -500,7 +554,7 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (!opcodeList1.empty()) raw.setUndefined(tag::OpcodeList1, opcodeList1);
 
     // The camera's lens corrections, for the reader to apply after demosaicing.
-    const std::vector<uint8_t> opcodeList3 = makeLensOpcodes(img, options.lensCorrections).opcodeList3;
+    const std::vector<uint8_t>& opcodeList3 = lensOpcodes.opcodeList3;
     if (!opcodeList3.empty()) raw.setUndefined(tag::OpcodeList3, opcodeList3);
     const bool hasOpcodes = !opcodeList1.empty() || !opcodeList3.empty();
 
@@ -536,8 +590,18 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         previewIfd.setShort(tag::YCbCrPositioning, 1);
         previewIfd.setRationals(tag::ReferenceBlackWhite, {0, 255, 128, 255, 128, 255});
         std::vector<std::vector<uint8_t>> strip;
-        strip.push_back(img.previewJpeg);
+        strip.push_back(previewJpeg);
         previewIfd.setChunks(tag::StripOffsets, tag::StripByteCounts, std::move(strip));
+        if (renderedPreview) {
+            // Who made it, and that it is sRGB; the camera's own JPEG is left
+            // to speak for itself.
+            const size_t space = options.software.find(' ');
+            if (space != 0 && !options.software.empty())
+                previewIfd.setAscii(tag::PreviewApplicationName, options.software.substr(0, space));
+            if (space != std::string::npos && space + 1 < options.software.size())
+                previewIfd.setAscii(tag::PreviewApplicationVersion, options.software.substr(space + 1));
+            previewIfd.setLong(tag::PreviewColorSpace, 2);
+        }
     }
 
     if (withThumbnail && withPreview)
