@@ -21,6 +21,10 @@ namespace dngconv {
 enum class DngCompression {
     None,          // uncompressed 16-bit samples, one strip
     LosslessJpeg,  // lossless JPEG in tiles
+    // Lossless JPEG XL in tiles, as DNG 1.7 defines it: smaller, but only
+    // readers of DNG 1.7 can open the file. Needs a build with libjxl
+    // (jxlAvailable()), and one or three samples per pixel.
+    JpegXl,
 };
 
 enum class DngPreview {
@@ -47,6 +51,8 @@ struct DngWriteOptions {
     /// Largest tile edge in pixels for compressed output. Must be even,
     /// 64..8192. Frames smaller than this are stored as a single tile.
     uint32_t tileSize = 512;
+    /// libjxl's effort for JPEG XL, 1 (fastest) to 9 (smallest).
+    int jxlEffort = 3;
     /// Worker threads for compression; 0 = one per CPU core.
     unsigned threads = 0;
     /// Render a small RGB thumbnail from the raw data and store it in the

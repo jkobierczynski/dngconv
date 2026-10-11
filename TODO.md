@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.8.0.
+Last updated: 2026-10-11, at version 0.9.0.
 
 ## Needs someone with the software or an account
 
@@ -77,15 +77,25 @@ close the largest gaps in the verification.
 - [ ] **Multi-frame files** beyond their first frame (pixel shift, dual
       exposure), **Fuji Super CCD** with the diagonal layout, and
       **floating-point raws**.
-- [ ] **JPEG XL compression** (DNG 1.7).
+- [ ] **JPEG XL: what the first version left open.**
+      - Open the files in Lightroom, Camera Raw or any other program that
+        reads DNG 1.7, and say in the README which do.
+      - Lossy JPEG XL (`--jxl-distance`), on the mosaic as Adobe's SDK does
+        it. The checksum is of the compressed data already; `--verify`
+        would need a notion of "close enough".
+      - JPEG XL for the previews (smaller than JPEG at the same quality).
+      - A bare codestream instead of the container when the sensor's depth
+        allows declaring twelve bits.
+      - The static-library detection for libjxl on Windows and macOS, on
+        those systems.
 - [ ] **A library interface**, so other programs can use the reader and the
       writer without the command line.
 
 ## Smaller items
 
-- [ ] `check`: decode Deflate-compressed and floating-point raw data, and
-      compare lossy-JPEG raw data with its own digest (`RawJPEGImageDigest`),
-      so that fewer files end up "not verified".
+- [ ] `check`: decode Deflate-compressed and floating-point raw data, so
+      that fewer files end up "not verified". (Lossy JPEG and JPEG XL are
+      checked by the checksum of their compressed data since 0.9.0.)
 - [ ] `check --add`: write the checksums into a DNG that has none, so that
       camera-written DNGs can be watched from then on.
 - [ ] Tile sizes that divide the frame evenly, so that no padding is needed
@@ -99,7 +109,8 @@ close the largest gaps in the verification.
       for archives whose file times cannot be trusted.
 - [ ] Choose the number of files converted at once from the memory that is
       free, instead of the fixed four.
-- [ ] Detect an input that already is a DNG before decoding it.
+- [ ] Detect an input that already is a DNG before decoding it. (Since
+      0.9.0 one the decoder cannot open is at least named as a DNG.)
 - [ ] Sigma X3F: document or automate building LibRaw with X3F support.
 
 ## Verification and tooling

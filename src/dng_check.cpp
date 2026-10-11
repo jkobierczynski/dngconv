@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "dng_digest.hpp"
+#include "jxl_codec.hpp"
 #include "ljpeg92.hpp"
 #include "original_raw.hpp"
 #include "parallel.hpp"
@@ -39,7 +40,12 @@ constexpr uint16_t kTileByteCounts = 325;
 constexpr uint16_t kSubIfds = 330;
 constexpr uint16_t kSampleFormat = 339;
 constexpr uint16_t kDngVersion = 50706;
+constexpr uint16_t kJpegTables = 347;
 constexpr uint16_t kLinearizationTable = 50712;
+constexpr uint16_t kRowInterleaveFactor = 50975;
+constexpr uint16_t kColumnInterleaveFactor = 52547;
+constexpr uint32_t kCompressionLossyJpeg = 34892;
+constexpr uint32_t kCompressionJxl = 52546;
 constexpr uint16_t kExtraCameraProfiles = 50933;
 constexpr uint16_t kRawImageDigest = 50972;
 constexpr uint16_t kNewRawImageDigest = 51111;
@@ -115,24 +121,90 @@ void unpackChunk(const std::vector<uint8_t>& raw, uint32_t columns, uint32_t row
     }
 }
 
-// Reads the raw image of a DNG as stored. Throws std::runtime_error for
-// damage and Unsupported for forms this code does not decode.
-void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned threads, StoredRawImage& image) {
-    uint32_t width = 0, height = 0;
-    if (!number(tiff, find(ifd, kImageWidth), width) || !number(tiff, find(ifd, kImageLength), height) ||
-        width == 0 || height == 0)
+// How the raw image lies in the file: its size and the table of strips or
+// tiles that hold it.
+struct Layout {
+    uint32_t width = 0, height = 0, planes = 1;
+    unsigned bits = 0;
+    uint32_t compression = 1;
+    bool tiled = false;
+    uint32_t chunkWidth = 0, chunkRows = 0;  // strips are tiles as wide as the image
+    uint32_t across = 0, down = 0;
+    std::vector<uint32_t> offsets, counts;
+    size_t chunks() const { return static_cast<size_t>(across) * down; }
+};
+
+// Throws std::runtime_error for damage and Unsupported for sizes beyond what
+// this code will hold in memory.
+Layout readLayout(const Tiff& tiff, const std::vector<Entry>& ifd) {
+    Layout l;
+    if (!number(tiff, find(ifd, kImageWidth), l.width) || !number(tiff, find(ifd, kImageLength), l.height) ||
+        l.width == 0 || l.height == 0)
         damaged("the raw image has no size");
-    const uint32_t planes = numberOr(tiff, ifd, kSamplesPerPixel, 1);
-    if (planes == 0 || planes > 8) damaged("the raw image has an impossible number of colour planes");
-    if (static_cast<uint64_t>(width) * height * planes > kMaxSamples)
+    l.planes = numberOr(tiff, ifd, kSamplesPerPixel, 1);
+    if (l.planes == 0 || l.planes > 8) damaged("the raw image has an impossible number of colour planes");
+    if (static_cast<uint64_t>(l.width) * l.height * l.planes > kMaxSamples)
         throw Unsupported{"the image is too large to check"};
 
     std::vector<uint32_t> bitsPerPlane;
     if (!numbers(tiff, find(ifd, kBitsPerSample), 8, bitsPerPlane)) bitsPerPlane = {1};
-    const unsigned bits = bitsPerPlane[0];
+    l.bits = bitsPerPlane[0];
     for (uint32_t b : bitsPerPlane)
-        if (b != bits) throw Unsupported{"colour planes of different depths"};
-    const uint32_t compression = numberOr(tiff, ifd, kCompression, 1);
+        if (b != l.bits) throw Unsupported{"colour planes of different depths"};
+    l.compression = numberOr(tiff, ifd, kCompression, 1);
+
+    l.chunkWidth = l.width;
+    l.chunkRows = l.height;
+    l.tiled = find(ifd, kTileOffsets) != nullptr;
+    if (l.tiled) {
+        if (!number(tiff, find(ifd, kTileWidth), l.chunkWidth) || !number(tiff, find(ifd, kTileLength), l.chunkRows) ||
+            l.chunkWidth == 0 || l.chunkRows == 0)
+            damaged("the tile size of the raw image is missing");
+        if (!numbers(tiff, find(ifd, kTileOffsets), kMaxChunks, l.offsets) ||
+            !numbers(tiff, find(ifd, kTileByteCounts), kMaxChunks, l.counts))
+            damaged("the tile table of the raw image cannot be read");
+    } else {
+        l.chunkRows = std::min(numberOr(tiff, ifd, kRowsPerStrip, l.height), l.height);
+        if (l.chunkRows == 0) damaged("the raw image has strips without rows");
+        if (!numbers(tiff, find(ifd, kStripOffsets), kMaxChunks, l.offsets) ||
+            !numbers(tiff, find(ifd, kStripByteCounts), kMaxChunks, l.counts))
+            damaged("the strip table of the raw image cannot be read");
+    }
+    l.across = (l.width + l.chunkWidth - 1) / l.chunkWidth;
+    l.down = (l.height + l.chunkRows - 1) / l.chunkRows;
+    if (l.offsets.size() < l.chunks() || l.counts.size() < l.chunks())
+        damaged("the raw image lists fewer strips or tiles than it needs");
+    if (static_cast<uint64_t>(l.chunkWidth) * l.chunkRows * l.planes > kMaxSamples)
+        damaged("the raw image has tiles of an impossible size");
+    return l;
+}
+
+// The bytes of one strip or tile. The file is one stream, so reads take
+// turns; whatever is done with the bytes can run in parallel.
+std::vector<uint8_t> readChunk(const Tiff& tiff, const Layout& l, size_t index, std::mutex& fileMutex) {
+    if (l.counts[index] == 0) damaged("a strip or tile of the raw image is empty");
+    if (static_cast<uint64_t>(l.offsets[index]) + l.counts[index] > tiff.limit - tiff.base)
+        damaged("raw image data lies beyond the end of the file (the file may be cut short)");
+    std::vector<uint8_t> raw(l.counts[index]);
+    std::lock_guard<std::mutex> lock(fileMutex);
+    if (!readAt(tiff, l.offsets[index], raw.data(), raw.size()))
+        damaged("the raw image data cannot be read from the file");
+    return raw;
+}
+
+// Where field f of an image dimension begins when its rows (or columns) are
+// stored field by field: field f holds every `factor`-th line from line f on.
+inline uint32_t fieldStart(uint32_t f, uint32_t size, uint32_t factor) {
+    return f * (size / factor) + std::min(f, size % factor);
+}
+
+// Reads the raw image of a DNG as stored. Throws std::runtime_error for
+// damage and Unsupported for forms this code does not decode.
+void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned threads, StoredRawImage& image) {
+    const Layout l = readLayout(tiff, ifd);
+    const uint32_t width = l.width, height = l.height, planes = l.planes;
+    const unsigned bits = l.bits;
+    const uint32_t compression = l.compression;
     if (numberOr(tiff, ifd, kSampleFormat, 1) != 1) throw Unsupported{"floating-point raw data"};
     if (bits < 8 || bits > 16) throw Unsupported{std::to_string(bits) + " bits per sample"};
     if (planes > 1 && numberOr(tiff, ifd, kPlanarConfiguration, 1) != 1)
@@ -142,42 +214,25 @@ void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned t
         case 1:
         case 7:
             break;
+        case kCompressionJxl:
+            if (!jxlAvailable()) throw Unsupported{"JPEG XL compression (this build has no libjxl)"};
+            if (planes != 1 && planes != 3) damaged("JPEG XL data with other than one or three colour planes");
+            break;
         case 8:
         case 32946:
             throw Unsupported{"Deflate compression"};
-        case 34892:
+        case kCompressionLossyJpeg:
             throw Unsupported{"lossy JPEG compression"};
-        case 52546:
-            throw Unsupported{"JPEG XL compression"};
         default:
             throw Unsupported{"compression type " + std::to_string(compression)};
     }
+    const uint32_t rowFactor = numberOr(tiff, ifd, kRowInterleaveFactor, 1);
+    const uint32_t columnFactor = numberOr(tiff, ifd, kColumnInterleaveFactor, 1);
+    if (rowFactor == 0 || columnFactor == 0 || rowFactor > height || columnFactor > width)
+        damaged("the raw image has an impossible interleave factor");
 
-    // Strips are tiles as wide as the image.
-    uint32_t chunkWidth = width, chunkRows = height;
-    std::vector<uint32_t> offsets, counts;
-    const bool tiled = find(ifd, kTileOffsets) != nullptr;
-    if (tiled) {
-        if (!number(tiff, find(ifd, kTileWidth), chunkWidth) || !number(tiff, find(ifd, kTileLength), chunkRows) ||
-            chunkWidth == 0 || chunkRows == 0)
-            damaged("the tile size of the raw image is missing");
-        if (!numbers(tiff, find(ifd, kTileOffsets), kMaxChunks, offsets) ||
-            !numbers(tiff, find(ifd, kTileByteCounts), kMaxChunks, counts))
-            damaged("the tile table of the raw image cannot be read");
-    } else {
-        chunkRows = std::min(numberOr(tiff, ifd, kRowsPerStrip, height), height);
-        if (chunkRows == 0) damaged("the raw image has strips without rows");
-        if (!numbers(tiff, find(ifd, kStripOffsets), kMaxChunks, offsets) ||
-            !numbers(tiff, find(ifd, kStripByteCounts), kMaxChunks, counts))
-            damaged("the strip table of the raw image cannot be read");
-    }
-    const uint32_t across = (width + chunkWidth - 1) / chunkWidth;
-    const uint32_t down = (height + chunkRows - 1) / chunkRows;
-    const uint64_t chunks = static_cast<uint64_t>(across) * down;
-    if (offsets.size() < chunks || counts.size() < chunks)
-        damaged("the raw image lists fewer strips or tiles than it needs");
-    if (static_cast<uint64_t>(chunkWidth) * chunkRows * planes > kMaxSamples)
-        damaged("the raw image has tiles of an impossible size");
+    const uint32_t chunkWidth = l.chunkWidth, chunkRows = l.chunkRows, across = l.across;
+    const bool tiled = l.tiled;
 
     image.width = width;
     image.height = height;
@@ -185,28 +240,32 @@ void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned t
     image.bitsPerSample = bits;
     image.samples.assign(static_cast<size_t>(width) * height * planes, 0);
 
-    std::mutex fileMutex;  // the file is one stream; the decoding is what runs in parallel
-    parallelFor(static_cast<size_t>(chunks), threads, [&](size_t index) {
+    std::mutex fileMutex;
+    parallelFor(l.chunks(), threads, [&](size_t index) {
         const uint32_t left = static_cast<uint32_t>(index % across) * chunkWidth;
         const uint32_t top = static_cast<uint32_t>(index / across) * chunkRows;
         // A tile always has its full size, padded at the image's edges; the
         // last strip has only the rows that are left.
         const uint32_t rows = tiled ? chunkRows : std::min(chunkRows, height - top);
         const size_t perRow = static_cast<size_t>(chunkWidth) * planes;
-
-        if (counts[index] == 0) damaged("a strip or tile of the raw image is empty");
-        if (static_cast<uint64_t>(offsets[index]) + counts[index] > tiff.limit - tiff.base)
-            damaged("raw image data lies beyond the end of the file (the file may be cut short)");
-        std::vector<uint8_t> raw(counts[index]);
-        {
-            std::lock_guard<std::mutex> lock(fileMutex);
-            if (!readAt(tiff, offsets[index], raw.data(), raw.size()))
-                damaged("the raw image data cannot be read from the file");
-        }
+        const std::vector<uint8_t> raw = readChunk(tiff, l, index, fileMutex);
 
         std::vector<uint16_t> decoded;
         if (compression == 1) {
             unpackChunk(raw, chunkWidth, rows, planes, bits, tiff.bigEndian, decoded);
+        } else if (compression == kCompressionJxl) {
+            JxlPicture picture;
+            try {
+                picture = decodeJxl(raw.data(), raw.size(), perRow * rows);
+            } catch (const std::exception& e) {
+                damaged(std::string("a tile of the raw image does not decode (") + e.what() + ")");
+            }
+            if (picture.width != chunkWidth || picture.height != rows || picture.channels != planes)
+                damaged("a JPEG XL tile of the raw image has the wrong size");
+            // Lossy data has no values of its own to compare: what comes out
+            // depends on the decoder.
+            if (!picture.originalValues) throw Unsupported{"lossy JPEG XL compression"};
+            decoded = std::move(picture.samples);
         } else {
             LosslessJpegFrame frame;
             decoded = decodeLosslessJpeg(raw.data(), raw.size(), frame, perRow * rows * 2 + 64);
@@ -222,6 +281,46 @@ void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned t
             std::memcpy(&image.samples[(static_cast<size_t>(top + y) * width + left) * planes],
                         &decoded[static_cast<size_t>(y) * perRow], copy * sizeof(uint16_t));
     });
+
+    // Rows and columns stored field by field (DNG 1.7 does this to a mosaic,
+    // so that each colour forms a picture of its own) go back to their places.
+    if (rowFactor > 1 || columnFactor > 1) {
+        std::vector<uint32_t> storedColumn(width);
+        for (uint32_t x = 0; x < width; ++x)
+            storedColumn[x] = fieldStart(x % columnFactor, width, columnFactor) + x / columnFactor;
+        std::vector<uint16_t> ordered(image.samples.size());
+        parallelFor(height, threads, [&](size_t y) {
+            const uint32_t row = static_cast<uint32_t>(y);
+            const uint16_t* from =
+                &image.samples[static_cast<size_t>(fieldStart(row % rowFactor, height, rowFactor) + row / rowFactor) * width * planes];
+            uint16_t* to = &ordered[y * width * planes];
+            for (uint32_t x = 0; x < width; ++x)
+                for (uint32_t k = 0; k < planes; ++k) to[static_cast<size_t>(x) * planes + k] = from[static_cast<size_t>(storedColumn[x]) * planes + k];
+        });
+        image.samples = std::move(ordered);
+    }
+}
+
+// The checksum DNG defines for raw data stored with JPEG XL or lossy JPEG:
+// not of the pixels, which a lossy decoder does not reproduce bit for bit,
+// but of the compressed data. It is the MD5 of the MD5s of the strips or
+// tiles, in order, followed by that of the shared JPEG tables if there are
+// any. Adobe's SDK uses it for JPEG XL whether the data is lossless or not.
+Md5Digest compressedDataDigest(const Tiff& tiff, const std::vector<Entry>& ifd, const Layout& l, unsigned threads) {
+    std::vector<Md5Digest> parts(l.chunks());
+    std::mutex fileMutex;
+    parallelFor(l.chunks(), threads, [&](size_t index) {
+        const std::vector<uint8_t> raw = readChunk(tiff, l, index, fileMutex);
+        parts[index] = Md5::of(raw.data(), raw.size());
+    });
+    if (const Entry* tables = find(ifd, kJpegTables); tables && l.compression == kCompressionLossyJpeg) {
+        std::vector<uint8_t> raw;
+        if (!loadValue(tiff, *tables, 1u << 20, raw)) damaged("the JPEG tables of the raw image cannot be read");
+        parts.push_back(Md5::of(raw.data(), raw.size()));
+    }
+    Md5 all;
+    for (const Md5Digest& d : parts) all.update(d.data(), d.size());
+    return all.finish();
 }
 
 // The 16 bytes of a digest tag, or false if the tag is absent or malformed.
@@ -319,6 +418,17 @@ uint64_t requiredSize(const Opened& dng) {
 
 }  // namespace
 
+bool isDngFile(const std::filesystem::path& path) {
+    try {
+        Source src(path);
+        Opened dng;
+        openDng(src, dng);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned threads) {
     Source src(path);
     Opened dng;
@@ -360,6 +470,36 @@ DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
         result.rawDetail = "the file has no raw image directory";
     } else {
         try {
+            const uint32_t compression = numberOr(tiff, *rawIfd, kCompression, 1);
+            if (compression == kCompressionJxl || compression == kCompressionLossyJpeg) {
+                // The checksum is of the compressed data; nothing needs decoding.
+                const Layout l = readLayout(tiff, *rawIfd);
+                result.width = l.width;
+                result.height = l.height;
+                result.planes = l.planes;
+                result.bitsPerSample = l.bits;
+                if (!hasNew && !hasOld) {
+                    // Without a checksum, at least see whether it decodes.
+                    if (compression == kCompressionJxl && jxlAvailable()) {
+                        try {
+                            StoredRawImage image;
+                            readStoredImage(tiff, *rawIfd, threads, image);
+                        } catch (const Unsupported&) {
+                        }
+                    }
+                    result.rawImage = DngCheck::State::Unverified;
+                    result.rawDetail = "the file carries no checksum of its raw data";
+                } else if (hasMask) {
+                    result.rawImage = DngCheck::State::Unverified;
+                    result.rawDetail = "cannot check: the image has a transparency mask";
+                } else {
+                    const Md5Digest found = compressedDataDigest(tiff, *rawIfd, l, threads);
+                    const bool ok = found == (hasNew ? newDigest : oldDigest);
+                    result.rawImage = ok ? DngCheck::State::Intact : DngCheck::State::Damaged;
+                    result.rawDetail = ok ? (hasNew ? "NewRawImageDigest" : "RawImageDigest")
+                                          : "the raw image data does not match its checksum";
+                }
+            } else {
             StoredRawImage image;
             readStoredImage(tiff, *rawIfd, threads, image);
             result.width = image.width;
@@ -389,6 +529,7 @@ DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
                 result.rawImage = ok ? DngCheck::State::Intact : DngCheck::State::Damaged;
                 result.rawDetail = ok ? (hasNew ? "NewRawImageDigest" : "RawImageDigest")
                                       : "the raw image data does not match its checksum";
+            }
             }
         } catch (const Unsupported& u) {
             result.rawImage = DngCheck::State::Unverified;

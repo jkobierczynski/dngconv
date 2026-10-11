@@ -6,9 +6,9 @@ A command-line converter from camera raw files to Adobe's Digital Negative
 Decoding is done by [LibRaw](https://www.libraw.org/), so every camera LibRaw
 knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
-zlib.
+zlib, and, if JPEG XL compression is wanted, libjxl.
 
-Status: **0.8.0, early**. It works on the cameras listed under
+Status: **0.9.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -18,6 +18,9 @@ Status: **0.8.0, early**. It works on the cameras listed under
   described in tags. No demosaicing, no white balance, no scaling.
 - Lossless JPEG compression in tiles (the standard DNG scheme), compressed on
   all CPU cores, or uncompressed output.
+- Or **lossless JPEG XL** (`-c jxl`), the compression DNG 1.7 added: the
+  same samples in files 14 % smaller on average, for programs that read
+  DNG 1.7. See [JPEG XL compression](#jpeg-xl-compression).
 - Bayer sensors, Fuji X-Trans, and full-colour raws such as Canon sRAW.
 - Colour: calibrated matrix (D65) and as-shot white balance, or the **camera
   profiles** you choose (`--profile`): DCP files such as Adobe Standard, the
@@ -54,23 +57,26 @@ Status: **0.8.0, early**. It works on the cameras listed under
 
 [Tagged releases on GitHub](https://github.com/jkobierczynski/dngconv/releases)
 carry ready-made binaries for Linux (x86_64), macOS
-(Apple Silicon) and Windows (x64). They are self-contained: LibRaw and zlib
-are linked in. Unpack the archive and run `dngconv` from a terminal.
+(Apple Silicon) and Windows (x64). They are self-contained: LibRaw, zlib
+and libjxl are linked in (`dngconv --version` tells whether a binary has
+JPEG XL). Unpack the archive and run `dngconv` from a terminal.
 
 The binaries are built by `.github/workflows/release.yml` whenever a version
 tag is pushed; see `DEVELOPMENT.md` for how a release is made.
 
 ## Build
 
-Needs CMake 3.16+, a C++17 compiler, LibRaw 0.21 or newer and zlib.
+Needs CMake 3.16+, a C++17 compiler, LibRaw 0.21 or newer and zlib. libjxl
+0.7 or newer is optional: with it dngconv can write JPEG XL, without it
+everything else works.
 
 ```sh
 # Debian / Ubuntu
-sudo apt install build-essential cmake libraw-dev zlib1g-dev
+sudo apt install build-essential cmake libraw-dev zlib1g-dev libjxl-dev
 # Fedora / RHEL (EPEL)
-sudo dnf install gcc-c++ cmake LibRaw-devel zlib-devel
+sudo dnf install gcc-c++ cmake LibRaw-devel zlib-devel libjxl-devel
 # macOS (zlib comes with the system)
-brew install cmake libraw
+brew install cmake libraw jpeg-xl
 
 cmake -S . -B build
 cmake --build build
@@ -78,8 +84,12 @@ ctest --test-dir build        # optional
 sudo cmake --install build    # optional, installs the dngconv binary
 ```
 
-On Windows, install both through vcpkg
-(`vcpkg install libraw:x64-windows zlib:x64-windows`) and pass vcpkg's toolchain file to CMake; see `.github/workflows/ci.yml`.
+On Windows, install them through vcpkg
+(`vcpkg install libraw:x64-windows zlib:x64-windows libjxl:x64-windows`) and pass vcpkg's toolchain file to CMake; see `.github/workflows/ci.yml`.
+
+CMake says whether it found libjxl ("JPEG XL: enabled"). `-DDNGCONV_JXL=ON`
+makes it a requirement, `-DDNGCONV_JXL=OFF` leaves it out, and
+`-DJXL_INCLUDE_DIR=... "-DJXL_LIBRARY=..."` points to a particular one.
 
 To build against a LibRaw you compiled yourself:
 
@@ -100,12 +110,17 @@ dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
 dngconv --lens-corrections none *.ARW # leave the lens corrections out
 dngconv --profile ~/profiles *.CR3    # embed the camera profiles that fit
 dngconv --preview render --preview-size 2048 *.NEF   # previews made here
+dngconv -c jxl -o small/ *.ARW        # JPEG XL: smaller, for DNG 1.7 readers
 dngconv -i shot.RAF                   # show what the decoder finds
 ```
 
 ```
   -o, --output <path>       output file (one input) or output folder
-  -c, --compression <mode>  lossless (default) or none
+  -c, --compression <mode>  lossless (default; lossless JPEG, read by every
+                            DNG program), jxl (lossless JPEG XL: smaller,
+                            but needs a reader of DNG 1.7), or none
+      --jxl-effort <n>      how hard JPEG XL tries, 1 (fastest) to 9
+                            (smallest, much slower); default 3
       --preview <which>     the JPEG preview in the DNG: auto (default; the
                             camera's own, or one rendered from the raw data
                             if the file has none), camera, render, or none
@@ -273,12 +288,13 @@ What it covers, and what it cannot:
 - The unused part of the last tiles (they are always stored at full size) is
   not part of the picture, so a change there goes unreported; Adobe's
   validator treats it the same.
-- Raw data stored as lossy JPEG, JPEG XL, Deflate or floating point is not
-  decoded; those files are reported as "not verified".
+- Raw data stored with Deflate or as floating point is not decoded; those
+  files are reported as "not verified". Lossy JPEG and JPEG XL data is
+  checked without decoding: its checksum is of the compressed bytes.
 
 ## What has been tested
 
-Each file below was converted and then checked in up to nine ways:
+Each file below was converted and then checked in up to ten ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -316,22 +332,27 @@ Each file below was converted and then checked in up to nine ways:
    was decoded with libjpeg and laid over the camera's own JPEG of the same
    shot. See [Previews](#previews).
 
-| Camera | Format | Sensor data | Source | DNG | Rendering difference |
-|---|---|---|---:|---:|---|
-| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | none, see "What LibRaw decides" |
-| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 24.1 MB | none |
-| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.0 MB | none |
-| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 19.3 MB | none |
-| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 5.8 MB | none |
-| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.7 MB | none |
-| Nikon D3S | NEF | Bayer | 10.2 MB | 9.3 MB | none |
-| Nikon D4 | NEF | Bayer | 16.4 MB | 15.3 MB | none |
-| Olympus E-M10 | ORF | Bayer | 13.8 MB | 15.9 MB | none |
-| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 18.9 MB | 50 defect pixels, see below |
-| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 38.7 MB | none |
-| Samsung NX3000 | SRW | Bayer | 26.2 MB | 25.4 MB | none |
-| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 26.8 MB | none |
-| Sony NEX-5N | ARW | Bayer | 16.3 MB | 20.8 MB | none |
+10. **JPEG XL**: converted again with `-c jxl`. dngconv's own reader gets
+    every sample back, and Adobe's DNG SDK 1.7.1, the reference reader for
+    this compression, gets the same raw data out of each file as out of the
+    lossless-JPEG DNG. See [JPEG XL compression](#jpeg-xl-compression).
+
+| Camera | Format | Sensor data | Source | DNG | DNG with `-c jxl` | Rendering difference |
+|---|---|---|---:|---:|---:|---|
+| Canon EOS R8 | CR3 | Bayer | 35.9 MB | 34.7 MB | 33.3 MB | none, see "What LibRaw decides" |
+| Canon EOS 5D Mark II | CR2 | Bayer | 25.2 MB | 24.1 MB | 22.7 MB | none |
+| Canon EOS 40D | CR2 sRAW | full colour | 6.5 MB | 8.0 MB | 5.4 MB | none |
+| Fujifilm X-E1 | RAF | X-Trans | 24.9 MB | 19.3 MB | 15.0 MB | none |
+| Fujifilm FinePix S5500 | RAF | Bayer | 8.1 MB | 5.8 MB | 4.4 MB | none |
+| Kodak DC50 | KDC | Bayer | 0.1 MB | 0.7 MB | 0.5 MB | none |
+| Nikon D3S | NEF | Bayer | 10.2 MB | 9.3 MB | 8.6 MB | none |
+| Nikon D4 | NEF | Bayer | 16.4 MB | 15.3 MB | 14.0 MB | none |
+| Olympus E-M10 | ORF | Bayer | 13.8 MB | 15.9 MB | 14.5 MB | none |
+| Panasonic DMC-GF7 | RW2 | Bayer | 18.8 MB | 18.9 MB | 14.2 MB | 50 defect pixels, see below |
+| Pentax K-1 Mark II | PEF | Bayer | 41.9 MB | 38.7 MB | 37.0 MB | none |
+| Samsung NX3000 | SRW | Bayer | 26.2 MB | 25.4 MB | 23.2 MB | none |
+| Sony ILCE-7M3 | ARW | Bayer | 23.6 MB | 26.8 MB | 19.8 MB | none |
+| Sony NEX-5N | ARW | Bayer | 16.3 MB | 20.8 MB | 14.8 MB | none |
 
 Sizes include the thumbnail (about 130 KB, uncompressed), the camera's JPEG
 preview and the maker note, which is stored twice (see
@@ -530,6 +551,88 @@ corrected, so they show the picture as a reader of the opcodes will.
 **Accuracy of the conversion.** The cameras use tables and formulas of their
 own; DNG wants polynomials. The fit is reported for every file (`-i`, see
 above) and stayed below 0.4 pixels and 0.5 % brightness on the samples.
+
+## JPEG XL compression
+
+DNG 1.7 added JPEG XL as a way to store the raw data, and `-c jxl` uses it,
+losslessly: the DNG holds the same samples as with the default compression,
+in less space. On the fifteen samples the files are 14 % smaller in total;
+single cameras range from 4 % (Canon EOS R8, Pentax K-1 II) to between 22
+and 33 % (Fujifilm, Panasonic, both Sonys, Canon sRAW), as the table under
+[What has been tested](#what-has-been-tested) shows.
+
+```sh
+dngconv -c jxl -o small/ *.ARW
+dngconv -c jxl --jxl-effort 2 --verify -r -o ~/dng ~/photos
+```
+
+**The price is compatibility.** A file written this way says that it needs
+a reader of DNG 1.7.1, and older software will not open it. That includes
+everything built on LibRaw up to 0.22 unless it was compiled with Adobe's
+SDK; darktable 4.6 and RawTherapee 5.10, tried here, both refuse the
+files. Adobe published DNG 1.7 in 2023 and its SDK reads these files; its
+applications were not at hand to try. Check that what you use opens such a
+file before converting an archive, or keep the default: lossless JPEG is read by every DNG program there is. Thumbnail,
+preview and metadata are stored as always, so file browsers and ExifTool
+are not affected.
+
+**Speed and the effort setting.** libjxl offers nine levels of effort.
+Measured on three of the samples (58 megapixels together, two CPU cores,
+libjxl 0.11.1; the time is for the whole conversion):
+
+| | Raw data | Time |
+|---|---:|---:|
+| lossless JPEG (default) | 73.1 MB | 1.9 s |
+| `-c jxl --jxl-effort 1` | 70.3 MB | 1.2 s |
+| `--jxl-effort 2` | 60.9 MB | 2.0 s |
+| `--jxl-effort 3` (default) | 60.4 MB | 3.0 s |
+| `--jxl-effort 5` | 59.3 MB | 13 s |
+| `--jxl-effort 7` | 59.3 MB | 22 s |
+| `--jxl-effort 9` | 59.5 MB | 87 s |
+
+Almost all of the gain is there at level 2 or 3; beyond that, time goes up
+by the factor and size by the per cent. With the older libjxl 0.7 that
+Ubuntu 24.04 ships, level 1 compresses nearly as well as level 2.
+
+**How the data is stored.** The way Adobe's SDK stores a mosaic
+losslessly:
+
+- Rows and columns are stored field by field (`RowInterleaveFactor`,
+  `ColumnInterleaveFactor`, both set to the period of the mosaic). For a
+  Bayer sensor the stored picture is four quarter-size pictures, one per
+  colour position; for X-Trans it is 36. A picture of one colour is smooth,
+  which is what the coder needs.
+- That picture is cut into tiles of at most 512 pixels, sized so that their
+  edges fall on the edges of the fields where the frame divides evenly, and
+  each tile is coded on its own, on all CPU cores.
+- A tile is a 16-bit greyscale picture (three channels for full-colour
+  raws) in JPEG XL's small container format, which libjxl uses for data of
+  this depth. `JXLDistance` 0 and `JXLEffort` are recorded.
+- `NewRawImageDigest` is, as the format has it for this compression, the
+  checksum of the compressed tiles, not of the samples. `RawDataUniqueID`
+  stays the same as for a lossless-JPEG DNG of the same shot.
+
+Frames with two or four samples per pixel cannot be stored this way; they
+keep lossless JPEG, with a note.
+
+**Verification.** `--verify` cannot use LibRaw here, so it reads the DNG
+back with dngconv's own reader (the one behind `dngconv check`) and
+compares every sample with the source. That is a round trip through one
+library, which is why the files were also given to another reader:
+
+| Check | Result |
+|---|---|
+| Adobe's `dng_validate` from the DNG SDK 1.7.1 on the 15 sample DNGs | no error; it recomputes the checksum and puts rows and columns back |
+| The raw image as that reader hands it on ("stage 1"), compared with the one it reads from the lossless-JPEG DNG of the same file | identical for all 15, among them X-Trans (36 fields) and Canon sRAW (three channels) |
+| Ten synthetic frames from the unit tests (odd sizes such as 617 x 413 X-Trans, a frame 3 pixels wide, 2 x 2 pixels), read by the same reader | identical to what was written |
+| The other direction: six lossless JPEG XL DNGs written by Adobe's SDK (libjxl 0.11.1), read by dngconv built with libjxl 0.7 | the same samples; `check` finds them intact |
+| `dngconv check` on the 14 DNG 1.7 samples that come with Adobe's SDK | 12 intact by their checksums; two hold kinds of data it does not judge (floating point, a transparency mask) |
+| Built with libjxl 0.7.0 and with 0.11.1 | files from one are read by the other |
+
+`dngconv check` works on JPEG XL DNGs in every build, with or without
+libjxl: the checksum is of the compressed data, so nothing has to be
+decoded. `tools/compare_raw_data.py` repeats the second row for any pair of
+files, and `tools/dng-validate/build.sh --sdk 1.7` builds the validator.
 
 ## Previews
 
@@ -755,8 +858,8 @@ newer LibRaw.
 - Sigma X3F works only if your LibRaw was built with X3F support; most
   distribution packages are not.
 - A second calibration illuminant of dngconv's own (a profile given with
-  `--profile` brings its own), DNG 1.6/1.7 features (JPEG XL compression
-  among them).
+  `--profile` brings its own).
+- Lossy JPEG XL, and JPEG XL for the previews.
 - Rendered previews at the sensor's full resolution (that needs
   demosaicing), or developed with an embedded camera profile.
 
@@ -776,6 +879,7 @@ newer LibRaw.
 | `src/camera_profile.*` | Reads camera profiles (`.dcp`), picks those that fit a camera, packs them for the DNG |
 | `src/render.*` | Renders an sRGB picture from the raw data, for the thumbnail and for previews |
 | `src/jpeg_encoder.*` | Baseline JPEG encoder for rendered previews |
+| `src/jxl_codec.*` | Lossless JPEG XL through libjxl, where the build has it |
 | `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/dng_digest.*` | The two raw image digests DNG defines |
@@ -785,7 +889,7 @@ newer LibRaw.
 | `src/sidecar.*` | Finds and reads XMP sidecar files |
 | `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), JPEG XL (fields and compressed-data checksums on hand-built files; with libjxl the codec and the writer's files, without it the refusals), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.
@@ -800,7 +904,9 @@ in `TODO.md`.
 
 GPL-3.0-or-later, see `LICENSE`.
 
-LibRaw is used under the LGPL 2.1, zlib under the zlib licence. Camera
+LibRaw is used under the LGPL 2.1, zlib under the zlib licence, libjxl
+(with the Highway and Brotli libraries it builds on) under BSD and MIT
+licences. Camera
 profiles are not part of dngconv; a profile you embed keeps the licence its
 maker gave it. DNG is a format published by Adobe; this
 project is not affiliated with or endorsed by Adobe.

@@ -398,12 +398,15 @@ int main(int argc, char** argv) {
             Bytes strip(64, 0);
             DngCheck c = checkDng(writeFile(dir, "check_lossy.dng", handDng(8, 8, 1, 8, strip, false, 34892)));
             CHECK(c.rawImage == State::Unverified && !c.damaged() && !c.intact());
-            CHECK(c.rawDetail.find("lossy JPEG") != std::string::npos);
-            c = checkDng(writeFile(dir, "check_jxl.dng", handDng(8, 8, 1, 8, strip, false, 52546)));
+            // (Lossy JPEG has a checksum of its compressed data, tried in
+            // test_jxl; this file carries none.)
+            CHECK(c.rawDetail.find("no checksum") != std::string::npos);
+            c = checkDng(writeFile(dir, "check_deflate.dng", handDng(8, 8, 1, 8, strip, false, 8)));
             CHECK(c.rawImage == State::Unverified);
+            CHECK(c.rawDetail.find("Deflate") != std::string::npos);
             bool threw = false;
             try {
-                readStoredRawImage(dir / "check_jxl.dng");
+                readStoredRawImage(dir / "check_deflate.dng");
             } catch (const std::runtime_error&) {
                 threw = true;
             }

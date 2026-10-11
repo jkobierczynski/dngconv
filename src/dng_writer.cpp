@@ -20,6 +20,7 @@
 #include "original_raw.hpp"
 #include "parallel.hpp"
 #include "jpeg_encoder.hpp"
+#include "jxl_codec.hpp"
 #include "render.hpp"
 #include "tiff_writer.hpp"
 
@@ -86,6 +87,10 @@ constexpr uint16_t OpcodeList1 = 51008;
 constexpr uint16_t XMP = 700;
 constexpr uint16_t OpcodeList3 = 51022;
 constexpr uint16_t NewRawImageDigest = 51111;
+constexpr uint16_t RowInterleaveFactor = 50975;
+constexpr uint16_t ColumnInterleaveFactor = 52547;
+constexpr uint16_t JXLDistance = 52553;
+constexpr uint16_t JXLEffort = 52554;
 constexpr uint16_t PreviewApplicationName = 50966;
 constexpr uint16_t PreviewApplicationVersion = 50967;
 constexpr uint16_t PreviewColorSpace = 50970;
@@ -117,6 +122,7 @@ constexpr uint16_t GPSAltitude = 6;
 
 constexpr uint16_t kCompressionNone = 1;
 constexpr uint16_t kCompressionJpeg = 7;  // lossless JPEG for raw data, DCT JPEG for previews
+constexpr uint16_t kCompressionJxl = 52546;
 constexpr uint16_t kPhotometricRgb = 2;
 constexpr uint16_t kPhotometricYCbCr = 6;
 constexpr uint16_t kPhotometricCfa = 32803;
@@ -247,6 +253,84 @@ std::vector<std::vector<uint8_t>> compressTiles(const RawImage& img, const TileL
                                           tileRowSamples, 16);
     });
     return tiles;
+}
+
+// How a frame is stored for JPEG XL.
+//
+// A mosaic compresses badly as it is: neighbouring samples are of different
+// colours. DNG 1.7 lets rows and columns be stored field by field instead
+// (first every n-th row from row 0, then every n-th from row 1 ...), with n
+// the period of the mosaic. The stored picture is then a grid of small
+// pictures of one colour each, four of them for a Bayer sensor, which is
+// what the coder is good at. The tags RowInterleaveFactor and
+// ColumnInterleaveFactor tell the reader to put the lines back.
+struct JxlLayout {
+    uint32_t rowFactor = 1, columnFactor = 1;
+    uint32_t tileWidth = 0, tileHeight = 0;
+};
+
+// First line of field f when `size` lines are stored in `factor` fields.
+inline uint32_t fieldStart(uint32_t f, uint32_t size, uint32_t factor) {
+    return f * (size / factor) + std::min(f, size % factor);
+}
+
+JxlLayout chooseJxlLayout(const RawImage& img, uint32_t tileSize) {
+    JxlLayout l;
+    if (img.isCfa && img.cfaRows >= 2 && img.cfaRows < img.height) l.rowFactor = img.cfaRows;
+    if (img.isCfa && img.cfaCols >= 2 && img.cfaCols < img.width) l.columnFactor = img.cfaCols;
+    // Tiles of equal size that divide a field with as little left over as
+    // possible; where the frame divides evenly, their edges fall on the
+    // edges of the fields, so that no tile holds parts of two colours.
+    const auto side = [&](uint32_t size, uint32_t factor) {
+        const uint32_t field = (size + factor - 1) / factor;
+        const uint32_t count = (field + tileSize - 1) / tileSize;
+        return std::min((field + count - 1) / count, size);
+    };
+    l.tileWidth = side(img.width, l.columnFactor);
+    l.tileHeight = side(img.height, l.rowFactor);
+    return l;
+}
+
+// JPEG XL tiles of the frame in its stored order. Tiles on the right and
+// bottom edges are filled up by repeating the last column and row.
+std::vector<std::vector<uint8_t>> compressJxlTiles(const RawImage& img, const JxlLayout& l, int effort,
+                                                   unsigned threads) {
+    const uint32_t spp = img.samplesPerPixel;
+    // Which column and row of the frame each stored column and row is.
+    std::vector<uint32_t> column(img.width), row(img.height);
+    for (uint32_t x = 0; x < img.width; ++x)
+        column[fieldStart(x % l.columnFactor, img.width, l.columnFactor) + x / l.columnFactor] = x;
+    for (uint32_t y = 0; y < img.height; ++y)
+        row[fieldStart(y % l.rowFactor, img.height, l.rowFactor) + y / l.rowFactor] = y;
+
+    const uint32_t tilesAcross = (img.width + l.tileWidth - 1) / l.tileWidth;
+    const uint32_t tilesDown = (img.height + l.tileHeight - 1) / l.tileHeight;
+    std::vector<std::vector<uint8_t>> tiles(static_cast<size_t>(tilesAcross) * tilesDown);
+    parallelFor(tiles.size(), threads, [&](size_t index) {
+        const uint32_t tx = static_cast<uint32_t>(index % tilesAcross) * l.tileWidth;
+        const uint32_t ty = static_cast<uint32_t>(index / tilesAcross) * l.tileHeight;
+        std::vector<uint16_t> buffer(static_cast<size_t>(l.tileWidth) * l.tileHeight * spp);
+        for (uint32_t y = 0; y < l.tileHeight; ++y) {
+            const uint16_t* source = &img.pixels[static_cast<size_t>(row[std::min(ty + y, img.height - 1)]) * img.width * spp];
+            uint16_t* dst = &buffer[static_cast<size_t>(y) * l.tileWidth * spp];
+            for (uint32_t x = 0; x < l.tileWidth; ++x) {
+                const uint16_t* pixel = source + static_cast<size_t>(column[std::min(tx + x, img.width - 1)]) * spp;
+                for (uint32_t k = 0; k < spp; ++k) dst[static_cast<size_t>(x) * spp + k] = pixel[k];
+            }
+        }
+        tiles[index] = encodeJxlLossless(buffer.data(), l.tileWidth, l.tileHeight, spp, effort);
+    });
+    return tiles;
+}
+
+// The checksum DNG prescribes for JPEG XL data: of the compressed tiles, not
+// of the samples (the MD5 of the tiles' MD5s, in order).
+Md5Digest compressedTilesDigest(const std::vector<std::vector<uint8_t>>& tiles, unsigned threads) {
+    std::vector<Md5Digest> parts(tiles.size());
+    parallelFor(tiles.size(), threads, [&](size_t i) { parts[i] = Md5::of(tiles[i].data(), tiles[i].size()); });
+    Md5 all;
+    for (const Md5Digest& d : parts) all.update(d.data(), d.size());
+    return all.finish();
 }
 
 // 16-bit samples as bytes in the byte order of the file.
@@ -423,9 +507,14 @@ void validate(const RawImage& img) {
 
 void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& options) {
     validate(img);
-    if (options.compression == DngCompression::LosslessJpeg &&
+    if (options.compression != DngCompression::None &&
         (options.tileSize < 64 || options.tileSize > 8192 || (options.tileSize & 1)))
         throw std::invalid_argument("tile size must be an even number between 64 and 8192");
+    const bool jxl = options.compression == DngCompression::JpegXl;
+    if (jxl && img.samplesPerPixel != 1 && img.samplesPerPixel != 3)
+        throw std::invalid_argument("JPEG XL compression needs one or three samples per pixel");
+    if (jxl && !jxlAvailable())
+        throw std::runtime_error("this build of dngconv has no JPEG XL support (it was built without libjxl)");
 
     const MakerNote& note = img.source.makerNote;
     const bool withMakerNote = options.makerNotes && note.data.size() > 4 &&
@@ -492,7 +581,25 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     raw.setShort(tag::SamplesPerPixel, static_cast<uint16_t>(spp));
     raw.setShort(tag::PlanarConfiguration, 1);
 
-    if (options.compression == DngCompression::LosslessJpeg) {
+    Md5Digest jxlDigest{};
+    bool columnsInterleaved = false;
+    if (jxl) {
+        const JxlLayout layout = chooseJxlLayout(img, options.tileSize);
+        const int effort = std::clamp(options.jxlEffort, 1, 9);
+        std::vector<std::vector<uint8_t>> tiles = compressJxlTiles(img, layout, effort, options.threads);
+        if (options.digests) jxlDigest = compressedTilesDigest(tiles, options.threads);
+        raw.setShort(tag::Compression, kCompressionJxl);
+        raw.setLong(tag::TileWidth, layout.tileWidth);
+        raw.setLong(tag::TileLength, layout.tileHeight);
+        raw.setChunks(tag::TileOffsets, tag::TileByteCounts, std::move(tiles));
+        if (layout.rowFactor > 1) raw.setShort(tag::RowInterleaveFactor, static_cast<uint16_t>(layout.rowFactor));
+        if (layout.columnFactor > 1)
+            raw.setShort(tag::ColumnInterleaveFactor, static_cast<uint16_t>(layout.columnFactor));
+        columnsInterleaved = layout.columnFactor > 1;
+        // How it was coded: distance 0 is lossless.
+        raw.setRaw(tag::JXLDistance, 11, 1, {0, 0, 0, 0});
+        raw.setLong(tag::JXLEffort, static_cast<uint32_t>(effort));
+    } else if (options.compression == DngCompression::LosslessJpeg) {
         const TileLayout tile = chooseTileLayout(img, options.tileSize);
         raw.setShort(tag::Compression, kCompressionJpeg);
         raw.setLong(tag::TileWidth, tile.width);
@@ -613,7 +720,10 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (options.digests) {
         const Md5Digest imageDigest = newRawImageDigest(
             img.pixels.data(), img.width, img.height, img.samplesPerPixel, 2, options.threads);
-        ifd0.setBytes(tag::NewRawImageDigest, digestBytes(imageDigest));
+        // For JPEG XL the format wants the checksum of the compressed data.
+        // The identifier below stays with the samples either way, so that it
+        // is the same however the file was compressed.
+        ifd0.setBytes(tag::NewRawImageDigest, digestBytes(jxl ? jxlDigest : imageDigest));
         // Every opcode list counts: they change how the data is rendered.
         std::vector<uint8_t> opcodes = opcodeList1;
         opcodes.insert(opcodes.end(), opcodeList3.begin(), opcodeList3.end());
@@ -632,14 +742,19 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     }
 
     // ---- camera and picture description (always in IFD0) ------------------------
-    // 1.4, unless a profile uses tags that came later.
-    unsigned dngVersion = 0x0104;
+    // 1.4, unless JPEG XL or a profile uses what came later.
+    unsigned dngVersion = jxl ? 0x0107 : 0x0104;
     if (withProfiles)
         for (const auto& profile : options.profiles) dngVersion = std::max(dngVersion, profile->dngVersion);
-    ifd0.setBytes(tag::DNGVersion,
-                  {static_cast<uint8_t>(dngVersion >> 8), static_cast<uint8_t>(dngVersion & 0xff), 0, 0});
-    // Opcode lists arrived with DNG 1.3; everything else here is 1.1 material.
-    ifd0.setBytes(tag::DNGBackwardVersion, {1, static_cast<uint8_t>(hasOpcodes ? 3 : 1), 0, 0});
+    ifd0.setBytes(tag::DNGVersion, {static_cast<uint8_t>(dngVersion >> 8), static_cast<uint8_t>(dngVersion & 0xff),
+                                    static_cast<uint8_t>(jxl ? 1 : 0), 0});
+    // The oldest reader that can open the file. JPEG XL arrived with DNG
+    // 1.7, columns stored field by field with 1.7.1, opcode lists with 1.3;
+    // everything else here is 1.1 material.
+    if (jxl)
+        ifd0.setBytes(tag::DNGBackwardVersion, {1, 7, static_cast<uint8_t>(columnsInterleaved ? 1 : 0), 0});
+    else
+        ifd0.setBytes(tag::DNGBackwardVersion, {1, static_cast<uint8_t>(hasOpcodes ? 3 : 1), 0, 0});
     ifd0.setShort(tag::Orientation, static_cast<uint16_t>(img.orientation));
     if (!img.make.empty()) ifd0.setAscii(tag::Make, img.make);
     if (!img.model.empty()) ifd0.setAscii(tag::Model, img.model);

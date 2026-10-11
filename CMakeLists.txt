@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.8.0 LANGUAGES CXX
+project(dngconv VERSION 0.9.0 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -12,6 +12,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(DNGCONV_BUILD_TESTS "Build the test suite" ON)
+set(DNGCONV_JXL "AUTO" CACHE STRING
+    "JPEG XL compression through libjxl: AUTO (if the library is found), ON (required) or OFF")
+set_property(CACHE DNGCONV_JXL PROPERTY STRINGS AUTO ON OFF)
 
 # ---- LibRaw -----------------------------------------------------------------
 # An explicit -DLIBRAW_INCLUDE_DIR=... -DLIBRAW_LIBRARY=... always wins (handy
@@ -94,6 +97,118 @@ find_package(Threads REQUIRED)
 # zlib compresses the original raw file when it is embedded in the DNG.
 find_package(ZLIB REQUIRED)
 
+# ---- libjxl (optional) --------------------------------------------------------
+# JPEG XL compression of the raw data (DNG 1.7) needs libjxl 0.7 or newer.
+# Without it everything else works; asking for JPEG XL is then refused.
+#
+# -DJXL_INCLUDE_DIR=... "-DJXL_LIBRARY=a;b;c" names it explicitly. Otherwise
+# pkg-config, where there is one, only tells where to look: the libraries
+# are then searched for by name, libjxl itself and those a static libjxl
+# stands on (its colour module, Highway, Brotli, Little CMS), and whichever
+# exist are linked in that order. That one rule serves a shared libjxl from
+# a distribution and a static one from vcpkg alike. A small program is
+# linked as a test before the result is trusted.
+add_library(dngconv_jxl INTERFACE)
+set(_jxl_found FALSE)
+if(NOT DNGCONV_JXL STREQUAL "OFF")
+  set(_jxl_includes "")
+  set(_jxl_libraries "")
+  if(JXL_INCLUDE_DIR AND JXL_LIBRARY)
+    set(_jxl_includes ${JXL_INCLUDE_DIR})
+    set(_jxl_libraries ${JXL_LIBRARY})
+  else()
+    set(_jxl_hints "")
+    set(_jxl_include_hints "")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(JXL_PC QUIET libjxl)
+      if(JXL_PC_FOUND)
+        set(_jxl_hints ${JXL_PC_LIBRARY_DIRS} ${JXL_PC_STATIC_LIBRARY_DIRS} ${JXL_PC_LIBDIR})
+        set(_jxl_include_hints ${JXL_PC_INCLUDE_DIRS} ${JXL_PC_STATIC_INCLUDE_DIRS} ${JXL_PC_INCLUDEDIR})
+      endif()
+    endif()
+    find_path(DNGCONV_JXL_INCLUDE jxl/encode.h HINTS ${_jxl_include_hints})
+    find_library(DNGCONV_JXL_LIB NAMES jxl libjxl HINTS ${_jxl_hints})
+    if(DNGCONV_JXL_INCLUDE AND DNGCONV_JXL_LIB)
+      set(_jxl_includes ${DNGCONV_JXL_INCLUDE})
+      set(_jxl_libraries ${DNGCONV_JXL_LIB})
+      foreach(_name jxl_cms hwy brotlienc brotlidec brotlicommon lcms2)
+        find_library(DNGCONV_JXL_DEP_${_name}
+                     NAMES ${_name} lib${_name} ${_name}-static lib${_name}-static
+                     HINTS ${_jxl_hints})
+        if(DNGCONV_JXL_DEP_${_name})
+          list(APPEND _jxl_libraries ${DNGCONV_JXL_DEP_${_name}})
+        endif()
+      endforeach()
+      if(UNIX)
+        list(APPEND _jxl_libraries m)
+      endif()
+    endif()
+  endif()
+
+  if(_jxl_libraries)
+    include(CheckCXXSourceCompiles)
+    # Visual Studio would build the test in its Debug configuration, which
+    # does not link with the release libraries a package manager provides.
+    if(CMAKE_CONFIGURATION_TYPES)
+      set(_jxl_saved_configuration "${CMAKE_TRY_COMPILE_CONFIGURATION}")
+      set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+    endif()
+    set(CMAKE_REQUIRED_INCLUDES ${_jxl_includes})
+    set(CMAKE_REQUIRED_LIBRARIES ${_jxl_libraries} Threads::Threads)
+    # A new variable name for every set of libraries tried, so that a cached
+    # failure does not outlive its cause.
+    string(MD5 _jxl_key "${_jxl_includes};${_jxl_libraries}")
+    check_cxx_source_compiles("
+      #include <jxl/decode.h>
+      #include <jxl/encode.h>
+      int main() {
+        JxlEncoder* e = JxlEncoderCreate(nullptr);
+        JxlEncoderFrameSettings* f = JxlEncoderFrameSettingsCreate(e, nullptr);
+        JxlEncoderSetFrameLossless(f, JXL_TRUE);
+        JxlEncoderCloseInput(e);
+        unsigned char buffer[64];
+        unsigned char* next = buffer;
+        size_t left = sizeof buffer;
+        JxlEncoderProcessOutput(e, &next, &left);
+        JxlEncoderDestroy(e);
+        JxlDecoder* d = JxlDecoderCreate(nullptr);
+        JxlDecoderCloseInput(d);
+        JxlDecoderProcessInput(d);
+        JxlDecoderDestroy(d);
+        return JxlEncoderVersion() < 7000 ? 1 : 0;
+      }" DNGCONV_JXL_LINKS_${_jxl_key})
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(CMAKE_CONFIGURATION_TYPES)
+      set(CMAKE_TRY_COMPILE_CONFIGURATION "${_jxl_saved_configuration}")
+    endif()
+    if(DNGCONV_JXL_LINKS_${_jxl_key})
+      target_include_directories(dngconv_jxl INTERFACE ${_jxl_includes})
+      target_link_libraries(dngconv_jxl INTERFACE ${_jxl_libraries})
+      target_compile_definitions(dngconv_jxl INTERFACE DNGCONV_HAVE_JXL=1)
+      set(_jxl_found TRUE)
+    else()
+      message(STATUS "libjxl was found (${_jxl_libraries}) but a test program does not build with it")
+    endif()
+  endif()
+endif()
+
+if(_jxl_found)
+  message(STATUS "JPEG XL: enabled (libjxl)")
+elseif(DNGCONV_JXL STREQUAL "ON")
+  message(FATAL_ERROR
+    "DNGCONV_JXL=ON, but libjxl 0.7 or newer was not found or cannot be linked.\n"
+    "  Debian/Ubuntu: sudo apt install libjxl-dev\n"
+    "  Fedora:        sudo dnf install libjxl-devel\n"
+    "  macOS:         brew install jpeg-xl\n"
+    "  Windows:       vcpkg install libjxl")
+elseif(DNGCONV_JXL STREQUAL "OFF")
+  message(STATUS "JPEG XL: switched off (DNGCONV_JXL=OFF)")
+else()
+  message(STATUS "JPEG XL: libjxl not found; building without JPEG XL compression")
+endif()
+
 # ---- warnings ---------------------------------------------------------------
 add_library(dngconv_warnings INTERFACE)
 if(MSVC)
@@ -114,6 +229,7 @@ add_library(dngconv_core STATIC
   src/lens_data.cpp
   src/lens_opcodes.cpp
   src/jpeg_encoder.cpp
+  src/jxl_codec.cpp
   src/ljpeg92.cpp
   src/ljpeg92_decode.cpp
   src/md5.cpp
@@ -129,7 +245,7 @@ target_include_directories(dngconv_core PUBLIC
   ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(dngconv_core
   PUBLIC Threads::Threads
-  PRIVATE dngconv_libraw ZLIB::ZLIB dngconv_warnings)
+  PRIVATE dngconv_libraw dngconv_jxl ZLIB::ZLIB dngconv_warnings)
 
 add_executable(dngconv src/main.cpp)
 target_link_libraries(dngconv PRIVATE dngconv_core dngconv_warnings)
@@ -179,6 +295,10 @@ if(DNGCONV_BUILD_TESTS)
   add_executable(test_check tests/test_check.cpp)
   target_link_libraries(test_check PRIVATE dngconv_core dngconv_warnings)
   add_test(NAME check COMMAND test_check ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(test_jxl tests/test_jxl.cpp)
+  target_link_libraries(test_jxl PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME jxl COMMAND test_jxl ${CMAKE_CURRENT_BINARY_DIR})
 
   add_executable(test_batch tests/test_batch.cpp)
   target_link_libraries(test_batch PRIVATE dngconv_core dngconv_warnings)

@@ -67,4 +67,8 @@ StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned th
 /// Damage inside a DNG is reported in the result, not thrown.
 DngCheck checkDng(const std::filesystem::path& path, unsigned threads = 0);
 
+/// Whether the file is a DNG at all (a TIFF with a DNGVersion tag). Never
+/// throws; an unreadable file is not one.
+bool isDngFile(const std::filesystem::path& path);
+
 }  // namespace dngconv

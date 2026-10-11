@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.8.0.
+Last updated: 2026-10-11, at version 0.9.0.
 
 ## Status at a glance
 
@@ -13,6 +13,7 @@ Last updated: 2026-10-11, at version 0.8.0.
 |---|---|
 | Raw decoding (through LibRaw) | Working: Bayer, X-Trans, full-colour raws |
 | DNG writing (own TIFF writer, lossless JPEG) | Working, both byte orders |
+| JPEG XL compression (`-c jxl`, DNG 1.7, through libjxl) | Working, lossless; Adobe's SDK 1.7.1 reads the same raw data from all 15 samples, and dngconv reads Adobe's files |
 | Pixel fidelity | Bit-exact on all 15 sample files |
 | Colour (matrix, white balance, levels) | Working, one illuminant (D65) |
 | Camera profiles (`--profile`) | Working: DCP files embedded as main and extra profiles; identical renders to an ExifTool-made reference in Adobe's code |
@@ -30,6 +31,8 @@ Last updated: 2026-10-11, at version 0.8.0.
 | macOS and Windows builds | Build and pass the unit tests on GitHub's runners; no camera file converted there yet |
 | Release workflow (binaries on a version tag) | Working: every release up to 0.5.0 was built and published by it |
 | Adobe's `dng_validate` (DNG SDK 1.5.1) | All 15 sample DNGs pass without an error, with and without an embedded original |
+| Adobe's `dng_validate` (DNG SDK 1.7.1) | Reads the JPEG XL DNGs without an error; also all the others |
+| libjxl 0.7.0 and 0.11.1; a build without libjxl | All three tested |
 | Adobe DNG Converter (extracting our originals, and ours extracting theirs) | **Never tried** |
 | Lightroom, Camera Raw | **Never tried** |
 | Repository | github.com/jkobierczynski/dngconv, tagged up to v0.5.0 |
@@ -464,6 +467,72 @@ Decisions:
 - **No time stamp in the preview directory** (`PreviewDateTime`): two
   conversions of the same file stay byte-identical.
 
+### 0.9.0 (2026-10-11): JPEG XL compression
+
+1. **`-c jxl`** and **`--jxl-effort <1..9>`**: the raw data as lossless
+   JPEG XL, stored the way Adobe's SDK stores a mosaic losslessly. Rows and
+   columns go field by field (`RowInterleaveFactor`,
+   `ColumnInterleaveFactor` = the period of the mosaic), the result is cut
+   into tiles, each tile is a 16-bit JPEG XL picture. DNG version 1.7.1.0.
+2. **libjxl as an optional dependency** (`jxl_codec.*`). CMake looks for
+   it, links a test program before trusting what it found, and builds
+   without JPEG XL otherwise; `DNGCONV_JXL=ON` or `OFF` settles it.
+   `dngconv --version` reports it.
+3. **The reader behind `check`** learnt JPEG XL tiles, interleaved rows and
+   columns (for any compression), and the checksum DNG uses for JPEG XL and
+   lossy JPEG data, which is of the compressed bytes. So `check` now
+   verifies those files too, lossy JPEG ones from other converters
+   included, and needs no libjxl for it. `--verify` uses this reader for
+   JPEG XL files, since LibRaw does not read them.
+4. `tools/compare_raw_data.py`, `tools/dng-validate/build.sh --sdk 1.7`, a
+   `jxl` step in `verify.sh`; libjxl in both workflows, with a warning in
+   the log where a platform's build ends up without it.
+5. A DNG given as input is now named as one even when the decoder cannot
+   open it.
+
+Findings:
+
+| Finding | Resolution |
+|---|---|
+| The specification's list of image kinds allowed with JPEG XL leaves out the colour filter array. Adobe's SDK accepts it, one of the sample files that come with the SDK is a Bayer mosaic in JPEG XL, and the specification's own text on `ColumnInterleaveFactor` describes the case. | Followed the SDK: mosaic kept as a mosaic, fields by the size of the pattern (2 x 2, or 6 x 6 for X-Trans, where 3 x 3 fields would mix red and blue). |
+| **The checksum is not of the samples.** For a raw image in JPEG XL, lossless or not, Adobe's reader compares `NewRawImageDigest` with the MD5 of the MD5s of the compressed tiles (for lossy JPEG, with that of the shared tables appended). A file with the usual checksum of its samples is reported as damaged. Not in the specification; read from the SDK's source. | The writer stores that checksum; `RawDataUniqueID` is still built from the checksum of the samples, so that it does not depend on the compression. Confirmed from the other side: `check` finds Adobe's own JPEG XL samples intact by this rule. |
+| The fields are laid out over the whole picture, not tile by tile, and a field of an odd-sized picture is one line longer than the next. | Same arithmetic in writer and reader, written twice independently (the test has a third, list-based version); Adobe's reader agrees on ten synthetic sizes. |
+| libjxl wraps every tile in its container format, 50 bytes more than a bare codestream, although nothing asked for it: 16 lossless bits need "level 10" of JPEG XL, and that has to be declared in a box. | Left as it is. Adobe's writer produces the same. |
+| Tile size hardly matters for most cameras (R8: 32.03, 32.02 and 32.00 MB at 442, 774 and 1547 pixels) but the Panasonic file goes from 14.05 to 16.03 MB at effort 3 as tiles grow. | Tiles of at most 512 pixels, the same limit as for lossless JPEG. |
+| Effort: nearly all of the gain is reached at level 2 or 3 (table in the README). Level 9 takes 87 s where level 3 takes 3, and is not smaller than level 5. With libjxl 0.11 level 1 is a different, faster coder that gains only 4 % on lossless JPEG. | Default 3. |
+| The thread sanitizer reported, in two runs of three, two encoders on different threads reading and writing the same block of memory inside libjxl 0.7: a table the library builds on first use. The library is not instrumented, so the sanitizer cannot see whether libjxl guards that itself. | The first call for each kind of picture now codes and decodes a small one alone while the other threads wait, so that first use never happens on two threads. Six runs after that: no report. Output was byte-identical across thread counts before and after. |
+| `cmake --build --parallel` without a number lets make start a compiler for every file at once. Building libjxl that way next to another build ran the machine out of memory. | The validator's build script passes the number of processors. |
+| With Visual Studio a CMake link test is built in the Debug configuration, which does not link with the release-only static libraries of the release workflow; libjxl would have been dropped there without a word. Found by reading, not by running: there is no Windows machine here. | The test is built as Release with multi-configuration generators (tried with Ninja Multi-Config). The workflows print a warning if a build has no JPEG XL. |
+
+How it was verified (libjxl 0.7.0 from Ubuntu and 0.11.1 built from the
+copy in Adobe's SDK):
+
+| Check | Result |
+|---|---|
+| `--verify` on the 15 samples, both libjxl versions | every sample back |
+| Adobe `dng_validate` 1.7.1 | no error on the 15 DNGs; three warnings about values the cameras wrote, as before |
+| Stage 1 image from `dng_validate -1` of each JPEG XL DNG against that of the lossless-JPEG DNG | identical, 15 of 15 |
+| Ten synthetic frames kept from `test_jxl` (odd sizes, X-Trans, three channels, tiny) through the same reader | identical to the frames written |
+| Six DNGs written by `dng_validate -losslessJXL -dng`, read by dngconv | same samples as the files they were made from; `check`: intact |
+| `check` on Adobe's 14 DNG 1.7 sample files | 12 intact, 2 not judged (floating point; transparency mask) |
+| Size against Adobe's writer (effort 7, larger tiles, about 20 s a file) | ours at effort 3 is 0.3 to 6 % larger (R8 32.03 against 31.95 MB, Panasonic 14.05 against 13.30) |
+| Sanitizers | ASan and UBSan: tests clean; `check` and the stored-image reader on 400 damaged copies of four JPEG XL DNGs (two writers): 110 decoded, 290 refused, no finding. TSan: see the findings |
+| A build with `-DDNGCONV_JXL=OFF` | tests pass; `-c jxl` is refused before any file is read; `check` still verifies JPEG XL files |
+| Other readers | rawpy (LibRaw 0.22.1), darktable 4.6.1 and RawTherapee 5.10 refuse the files; ExifTool 12.76 reads all metadata and does not know one tag (`JXLEffort`) by name |
+
+Decisions:
+
+- **Lossless only.** The point of this converter is that nothing is lost.
+  Lossy JPEG XL on a mosaic exists (Adobe's SDK has it) and would be a
+  small step from here; it is in the to-do list, not in the program.
+- **The default stays lossless JPEG.** Every DNG reader opens it. JPEG XL
+  is for people who know their software reads DNG 1.7.
+- **libjxl optional.** A converter that fails to build because a codec
+  library is missing serves nobody; and the checksum rule means even the
+  `check` command does not depend on it.
+- **Sixteen bits declared for every tile**, whatever the sensor's depth, as
+  Adobe does. Declaring twelve would save the container, and little else.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -593,7 +662,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (12 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
+| Unit tests (13 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -605,6 +674,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
+| JPEG XL | Adobe `dng_validate` 1.7.1 as reader (stage 1 image compared) and as writer; libjxl 0.7.0 and 0.11.1 | The reference reader gets the same raw data from a JPEG XL DNG as from the lossless-JPEG one, and dngconv reads Adobe's files; see the 0.9.0 history |
 | Rendered previews | libjpeg (Pillow, OpenCV), OpenCV SIFT matching against the camera's JPEG | The encoder writes what libjpeg would; the rendered picture has the camera's geometry and, within the spread between cameras, its tones; see the 0.8.0 history |
 | Camera profiles | ExifTool (tag values, and as the writer of a reference DNG), Adobe `dng_validate` (parsing, rendering, rewriting) | The embedded profile is the `.dcp` file's, and is developed as such; see the 0.7.0 history |
 | Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
@@ -638,6 +708,11 @@ Not covered by any check so far:
   Adobe-made DNG with an embedded original was at hand.
 - Originals of 4 GiB or more (refused), and memory use on very large files:
   the source file and its packed copy are both held in memory.
+- JPEG XL DNGs in Lightroom and Camera Raw (their reading code is what the
+  validator runs), and in any other program: none that reads DNG 1.7 was
+  at hand besides Adobe's SDK. libjxl on macOS and Windows: the build
+  logic for static libraries there was written without a machine to try it
+  on.
 - Rendered previews in the programs they are meant for: no file browser
   or photo manager on any system has been shown one.
 - Camera profiles in Lightroom's and Camera Raw's menus, Adobe's own
@@ -670,6 +745,13 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
       "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
 cmake --build build-asan
 ctest --test-dir build-asan --output-on-failure
+```
+
+Without JPEG XL, and against a particular libjxl:
+
+```sh
+cmake -S . -B build-nojxl -DDNGCONV_JXL=OFF
+PKG_CONFIG_PATH=/path/to/libjxl/lib/pkgconfig cmake -S . -B build-jxl -DDNGCONV_JXL=ON
 ```
 
 Against a self-built LibRaw, to check a second version:
@@ -705,8 +787,8 @@ git push origin vX.Y.Z
 1. checks that the tag and the CMake version agree (`v0.2.0` and `v0.2.0-rc1`
    both fit version 0.2.0; a tag with a suffix becomes a pre-release) and
    creates a **draft** release;
-2. builds on three runners. LibRaw, zlib and what LibRaw needs besides
-   (Little CMS, JasPer) are compiled from source by vcpkg and linked statically, so the
+2. builds on three runners. LibRaw, zlib, libjxl and what they need besides
+   (Little CMS, JasPer, Highway, Brotli) are compiled from source by vcpkg and linked statically, so the
    binaries run without anything installed;
 3. runs the tests and `dngconv --version` on each runner;
 4. packs `dngconv`, `README.md`, `LICENSE` and the licences of the linked

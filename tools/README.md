@@ -29,6 +29,7 @@ there is a tool for:
   ok       metadata  report written to .../metadata.txt (for reading; nothing is judged)
   ok       lens      4 files with a distortion opcode match their camera JPEG (see lens.log)
   ok       preview   12 rendered previews have the geometry of their camera JPEG; 3 more decode ...
+  ok       jxl       15 files read back by dngconv; Adobe's reader gets the same raw data from all 15 ...
   ok       profiles  9 DNGs carry the profiles made for their camera, value for value (...)
 
 all steps that ran passed
@@ -53,6 +54,7 @@ is 0 if no step that ran failed.
 | metadata | A report of which tags survive, for reading | ExifTool, Python |
 | lens | The DNG, developed with its lens opcodes, has the geometry of the camera's own JPEG | `dng_validate`, ExifTool, Python, OpenCV |
 | preview | Converted again with `--preview render`, every preview decodes as a JPEG and, where the raw file holds a camera JPEG, has its geometry | ExifTool, Python, OpenCV |
+| jxl | Converted again with `-c jxl`, every sample is read back, and Adobe's reader gets the same raw data out of each file as out of its lossless-JPEG twin. Runs only if dngconv was built with libjxl; the second half needs the 1.7 validator | dngconv with libjxl; `dng_validate` 1.7, Python, OpenCV |
 | profiles | Converted again with `--profile`, each DNG holds the profiles of its camera exactly as the `.dcp` files have them, and Adobe's reader parses them. Runs only when `PROFILES` names a folder of profiles | Python; `dng_validate` if present |
 
 Environment variables: `DNGCONV` (the program under test; default
@@ -66,16 +68,21 @@ freely available one).
 pip install -r tools/requirements.txt       # numpy, scipy, OpenCV, rawpy, Pillow
 sudo apt install libimage-exiftool-perl     # ExifTool
 tools/dng-validate/build.sh ~/dng-validate  # Adobe's validator, see below
+# or, to check JPEG XL files as well:  build.sh --sdk 1.7 ~/dng-validate
 export DNG_VALIDATE=~/dng-validate/dng_validate
 ```
 
 ### Adobe's validator
 
-`dng-validate/build.sh` downloads Adobe's DNG SDK 1.5.1 and builds
-`dng_validate` from it. The SDK is Adobe's and under Adobe's own licence;
+`dng-validate/build.sh` downloads Adobe's DNG SDK and builds
+`dng_validate` from it: version 1.5.1 by default, which takes a few minutes
+and reads everything but JPEG XL, or with `--sdk 1.7` version 1.7.1, which
+reads JPEG XL too and takes ten to twenty minutes because the libjxl that
+comes with the SDK is built first. The SDK is Adobe's and under Adobe's own licence;
 none of it is in this repository. The script takes it from the
-[raw2dng](https://github.com/Fimagena/raw2dng) project, pinned to one
-commit, and compiles every source file of the SDK into one program together
+[raw2dng](https://github.com/Fimagena/raw2dng) project (1.5.1) and from
+[hfiguiere/dng_sdk](https://github.com/hfiguiere/dng_sdk) (1.7.1), each
+pinned to one commit, and compiles every source file of the SDK into one program together
 with the XMP SDK that comes with it. It needs git, CMake, a C++ compiler and
 the development packages of libjpeg, zlib and expat, and has been run on
 Linux only.
@@ -88,6 +95,8 @@ dng_validate -v file.dng            # ... and print every tag and opcode it pars
 dng_validate -tif out file.dng      # develop the picture, opcodes applied, to out.tif
 dng_validate -3 out file.dng        # the linear image after the opcodes, 16 bit
 dng_validate -dng out file.dng      # read and write again, as Adobe would
+dng_validate -1 out file.dng        # the raw image as read from the file
+dng_validate -losslessJXL -dng out file.dng   # 1.7 only: rewrite with JPEG XL
 ```
 
 `-dng` is how the `check` command was tested against a second writer: the
@@ -134,6 +143,13 @@ it what the DNG's opcode will remove. It needs a detailed picture taken at
 low ISO.
 
 **`matching.py`** is the point matching the two lens scripts share.
+
+**`compare_raw_data.py DNG_A DNG_B`** has Adobe's validator write out the
+raw image it reads from each of the two files (decompressed, rows and
+columns back in place, nothing else done) and compares them sample for
+sample. With a lossless-JPEG DNG and a JPEG XL DNG of the same raw file it
+shows that the reference reader gets the same data from both, which LibRaw
+cannot show because it does not read JPEG XL.
 
 **`compare_preview.py RAW_FILE DNG_FILE`** is for DNGs converted with
 `--preview render`. It takes the preview out of the DNG, decodes it, and

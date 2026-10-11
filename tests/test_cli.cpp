@@ -254,6 +254,30 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- compression options ------------------------------------------------------------------
+    {
+        const std::string missing = quoted(gDir / "no-such-file.raw");
+        Run r = run("-c zip " + missing);
+        CHECK(r.status == 2 && contains(r.err, "lossless, jxl or none"));
+        r = run("--jxl-effort 0 " + missing);
+        CHECK(r.status == 2 && contains(r.err, "1 to 9"));
+        r = run("--jxl-effort 10 " + missing);
+        CHECK(r.status == 2);
+        r = run("-c none --jxl-effort 9 " + missing);
+        CHECK(r.status == 1 && contains(r.err, "no such file"));
+        // The version report says whether JPEG XL is in the build, and asking
+        // for it without is refused before any file is touched.
+        r = run("--version");
+        const bool withJxl = contains(r.out, "JPEG XL: libjxl ");
+        CHECK(withJxl || contains(r.out, "JPEG XL: not in this build"));
+        r = run("-c jxl " + missing);
+        CHECK(r.status == 1);
+        CHECK(contains(r.err, withJxl ? "no such file" : "no JPEG XL support"));
+        // A DNG given for conversion is named as what it is.
+        r = run("-o " + quoted(gDir / "again.dng") + " " + quoted(gDir / "in" / "shot00.dng"));
+        CHECK(r.status == 1 && contains(r.err, "already a DNG"));
+    }
+
     // ---- preview options --------------------------------------------------------------------
     {
         const std::string missing = quoted(gDir / "no-such-file.raw");

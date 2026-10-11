@@ -29,6 +29,7 @@
 #include "dng_check.hpp"
 #include "dng_writer.hpp"
 #include "job_runner.hpp"
+#include "jxl_codec.hpp"
 #include "original_raw.hpp"
 #include "raw_reader.hpp"
 #include "sidecar.hpp"
@@ -43,6 +44,7 @@ struct Settings {
     std::vector<std::string> inputs;
     std::string output;
     DngCompression compression = DngCompression::LosslessJpeg;
+    int jxlEffort = 3;
     DngPreview preview = DngPreview::Auto;
     uint32_t previewSize = 1024;  // longest edge of a rendered preview; 0 = largest
     bool makerNotes = true;
@@ -81,7 +83,11 @@ const char* const kUsage =
     "Options:\n"
     "  -o, --output <path>       output file (one input) or output folder\n"
     "                            (default: next to each source file)\n"
-    "  -c, --compression <mode>  lossless (default) or none\n"
+    "  -c, --compression <mode>  lossless (default; lossless JPEG, read by every\n"
+    "                            DNG program), jxl (lossless JPEG XL: smaller,\n"
+    "                            but needs a reader of DNG 1.7), or none\n"
+    "      --jxl-effort <n>      how hard JPEG XL tries, 1 (fastest) to 9\n"
+    "                            (smallest, much slower); default 3\n"
     "      --preview <which>     the JPEG preview in the DNG: auto (default; the\n"
     "                            camera's own, or one rendered from the raw data\n"
     "                            if the file has none), camera, render, or none\n"
@@ -277,6 +283,10 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
         } else if (a == "-V" || a == "--version") {
             std::printf("dngconv %s\ndecoder: LibRaw %s (%d camera models)\n", kVersion,
                         decoderVersion().c_str(), supportedCameraCount());
+            if (jxlAvailable())
+                std::printf("JPEG XL: libjxl %s\n", jxlVersion().c_str());
+            else
+                std::printf("JPEG XL: not in this build\n");
             exitCode = 0;
             return false;
         } else if (a == "-o" || a == "--output") {
@@ -290,11 +300,23 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
                 s.compression = DngCompression::LosslessJpeg;
             } else if (*v == "none") {
                 s.compression = DngCompression::None;
+            } else if (*v == "jxl" || *v == "jpegxl" || *v == "jpeg-xl") {
+                s.compression = DngCompression::JpegXl;
             } else {
-                std::fprintf(stderr, "dngconv: unknown compression '%s' (use lossless or none)\n",
+                std::fprintf(stderr, "dngconv: unknown compression '%s' (use lossless, jxl or none)\n",
                              v->c_str());
                 return false;
             }
+        } else if (a == "--jxl-effort") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            char* end = nullptr;
+            const long n = std::strtol(v->c_str(), &end, 10);
+            if (v->empty() || !end || *end || n < 1 || n > 9) {
+                std::fprintf(stderr, "dngconv: --jxl-effort needs a number from 1 to 9\n");
+                return false;
+            }
+            s.jxlEffort = static_cast<int>(n);
         } else if (a == "-j" || a == "--jobs") {
             if (!parseCount(args, i, "dngconv", s.threads)) return false;
         } else if (a == "-p" || a == "--parallel") {
@@ -589,7 +611,23 @@ void printInfo(const fs::path& path, const RawReadResult& r, const Settings& set
 }
 
 // Reads the written DNG back and compares every sample with the source.
-void verifyOutput(const RawImage& source, const fs::path& dng) {
+void verifyOutput(const RawImage& source, const fs::path& dng, bool jxl, unsigned threads) {
+    if (jxl) {
+        // The decoder library does not read JPEG XL; the reader of the check
+        // command does, and the file's own checksum is tried as well.
+        const StoredRawImage back = readStoredRawImage(dng, threads);
+        if (back.width != source.width || back.height != source.height || back.planes != source.samplesPerPixel)
+            throw std::runtime_error("verification failed: frame size differs after re-reading");
+        if (back.samples != source.pixels) {
+            size_t differing = 0;
+            for (size_t i = 0; i < source.pixels.size(); ++i)
+                if (back.samples[i] != source.pixels[i]) ++differing;
+            throw std::runtime_error("verification failed: " + std::to_string(differing) +
+                                     " samples differ after re-reading");
+        }
+        if (checkDng(dng, threads).rawImage == DngCheck::State::Damaged)
+            throw std::runtime_error("verification failed: the raw data does not match its checksum");
+    } else {
     RawReadOptions ro;
     ro.loadPreview = false;
     ro.copyMetadata = false;
@@ -610,6 +648,7 @@ void verifyOutput(const RawImage& source, const fs::path& dng) {
     if (b.activeTop != source.activeTop || b.activeLeft != source.activeLeft ||
         b.activeBottom != source.activeBottom || b.activeRight != source.activeRight)
         throw std::runtime_error("verification failed: active area differs after re-reading");
+    }
 
     // The embedded original must come back byte for byte.
     if (!source.originalFile.empty()) {
@@ -945,6 +984,12 @@ int main(int argc, char** argv) {
     int exitCode = 2;
     if (!parseArguments(args, settings, exitCode)) return exitCode;
 
+    if (settings.compression == DngCompression::JpegXl && !jxlAvailable() && !settings.info) {
+        std::fprintf(stderr, "dngconv: this build has no JPEG XL support (it was built without libjxl); "
+                             "use -c lossless\n");
+        return 1;
+    }
+
     // ---- camera profiles ---------------------------------------------------------
     ProfileLibrary library;
     for (const std::string& given : settings.profiles) {
@@ -990,7 +1035,13 @@ int main(int argc, char** argv) {
                 ro.loadPreview = settings.preview == DngPreview::Auto || settings.preview == DngPreview::Camera;
                 printInfo(job.input, readRaw(job.input, ro), settings, library);
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "dngconv: %s: %s\n", show(job.input).c_str(), e.what());
+                if (isDngFile(job.input))
+                    std::fprintf(stderr,
+                                 "dngconv: %s: a DNG the decoder cannot read (it may hold JPEG XL data); "
+                                 "'dngconv check' still tells whether it is intact\n",
+                                 show(job.input).c_str());
+                else
+                    std::fprintf(stderr, "dngconv: %s: %s\n", show(job.input).c_str(), e.what());
                 ++failures;
             }
         }
@@ -1029,6 +1080,7 @@ int main(int argc, char** argv) {
     const ThreadPlan plan = planThreads(settings, jobs.size());
     DngWriteOptions writeOptions;
     writeOptions.compression = settings.compression;
+    writeOptions.jxlEffort = settings.jxlEffort;
     writeOptions.threads = plan.perFile;
     writeOptions.preview = settings.preview;
     writeOptions.previewSize = settings.previewSize;
@@ -1085,7 +1137,14 @@ int main(int argc, char** argv) {
             ro.loadPreview = settings.preview == DngPreview::Auto || settings.preview == DngPreview::Camera;
             ro.keepOriginalFile = settings.embedOriginal;
             ro.readSidecar = settings.sidecar;
-            RawReadResult source = readRaw(job.input, ro);
+            RawReadResult source;
+            try {
+                source = readRaw(job.input, ro);
+            } catch (const std::exception&) {
+                // The decoder does not read every DNG (none with JPEG XL data).
+                if (isDngFile(job.input)) throw std::runtime_error("already a DNG; skipped");
+                throw;
+            }
             if (source.sourceIsDng) throw std::runtime_error("already a DNG; skipped");
 
             if (target.has_parent_path()) {
@@ -1106,6 +1165,16 @@ int main(int argc, char** argv) {
                                library.size(), library.size() == 1 ? "" : "s",
                                source.image.uniqueCameraModel.c_str()));
             }
+            // JPEG XL takes one or three samples per pixel; the rare frame with
+            // two or four keeps lossless JPEG.
+            if (options.compression == DngCompression::JpegXl && source.image.samplesPerPixel != 1 &&
+                source.image.samplesPerPixel != 3) {
+                options.compression = DngCompression::LosslessJpeg;
+                source.warnings.push_back(format("%u samples per pixel cannot be stored with JPEG XL; "
+                                                 "lossless JPEG was used",
+                                                 source.image.samplesPerPixel));
+            }
+            const bool jxl = options.compression == DngCompression::JpegXl;
             const PreviewPlan previewPlan = planPreview(source.image, options);
             std::string previewNote;
             if (previewPlan.kind == PreviewPlan::Kind::Rendered)
@@ -1118,7 +1187,7 @@ int main(int argc, char** argv) {
             }
 
             writeDng(source.image, target, options);
-            if (settings.verify) verifyOutput(source.image, target);
+            if (settings.verify) verifyOutput(source.image, target, jxl, plan.perFile);
             const LensOpcodes lens = makeLensOpcodes(source.image, settings.lensCorrections);
             for (const auto& note : lens.notes) source.warnings.push_back(note);
             if (settings.keepTimes && haveSourceTime) {
@@ -1134,9 +1203,10 @@ int main(int argc, char** argv) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
                 const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
-                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s)\n", name.c_str(),
+                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s%s)\n", name.c_str(),
                                     show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                                     megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
+                                    jxl ? ", JPEG XL" : "",
                                     lens.any() ? ", lens: " : "", lens.summary().c_str(),
                                     profileNote.c_str(), previewNote.c_str(),
                                     sidecar ? ", with " : "",

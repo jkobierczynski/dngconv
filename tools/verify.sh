@@ -26,6 +26,9 @@
 #                                                 the camera's JPEG, for files with a distortion opcode
 #   preview      dngconv --preview render,        (ExifTool, Python) every rendered preview decodes and
 #                compare_preview.py               has the geometry of the camera's JPEG
+#   jxl          dngconv -c jxl --verify,         (a dngconv with JPEG XL) samples read back; with
+#                compare_raw_data.py              dng_validate 1.7 and Python, Adobe's reader gets the
+#                                                 same raw data as from the lossless-JPEG DNG
 #   profiles     dngconv --profile, compare_profile.py   (Python; only with PROFILES set) every
 #                                                 embedded camera profile equals its .dcp file
 #
@@ -290,6 +293,44 @@ if [ "$have_python" = yes ] && [ "$have_exiftool" = yes ]; then
     fi
 else
     skipped preview "needs ExifTool and Python with opencv"
+fi
+
+# ---- JPEG XL ---------------------------------------------------------------------
+if "$dngconv" --version | grep -q 'JPEG XL: libjxl'; then
+    "$dngconv" -c jxl --verify -r -o "$work/jxl" "$raws" >"$work/jxl.log" 2>"$work/jxl.err"
+    written=$(grep -c ' -> ' "$work/jxl.log")
+    if grep -q 'verification failed' "$work/jxl.err" || [ "$written" -ne "$converted" ]; then
+        failed jxl "$written of $converted converted and read back; see $work/jxl.err"
+    elif ! "$dngconv" check -r -q "$work/jxl" >"$work/jxl.check" 2>&1; then
+        failed jxl "the check command does not find them intact; see $work/jxl.check"
+    else
+        # A second reader, if there is one that knows the format.
+        version=$( { [ -n "$validator" ] && [ -x "$validator" ] && "$validator" 2>&1; } | sed -n 's/.*version \([0-9]*\)\.\([0-9]*\).*/\1\2/p' | head -n 1)
+        if [ -n "$version" ] && [ "$version" -ge 17 ] && [ "$have_python" = yes ]; then
+            : >"$work/jxl.cmp"
+            good=0
+            bad=0
+            grep ' -> ' "$work/convert.log" >"$work/jxl.list" || true
+            while IFS= read -r line; do
+                rest=${line#* -> }
+                dng=${rest%%  (*}
+                if DNG_VALIDATE="$validator" "$python" "$here/compare_raw_data.py" "$work/jxl${dng#"$work/dng"}" "$dng" >>"$work/jxl.cmp" 2>&1; then
+                    good=$((good + 1))
+                else
+                    bad=$((bad + 1))
+                fi
+            done <"$work/jxl.list"
+            if [ "$bad" -eq 0 ]; then
+                passed jxl "$written files read back by dngconv; Adobe's reader gets the same raw data from all $good as from the lossless-JPEG DNGs"
+            else
+                failed jxl "Adobe's reader gets other raw data from $bad of $((good + bad)) files; see $work/jxl.cmp"
+            fi
+        else
+            passed jxl "$written files, samples read back by dngconv and checksums intact (no second reader: that needs dng_validate 1.7 and Python with opencv)"
+        fi
+    fi
+else
+    skipped jxl "this dngconv was built without libjxl"
 fi
 
 # ---- camera profiles -------------------------------------------------------------

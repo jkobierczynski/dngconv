@@ -22,23 +22,30 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install LibRaw and zlib (Linux)
+      # libjxl is optional: without it everything but JPEG XL compression is
+      # built and tested. On Linux it is required here, so that a break shows;
+      # on the other two systems its absence is reported as a warning below.
+      - name: Install LibRaw, zlib and libjxl (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libraw-dev zlib1g-dev ninja-build
+          sudo apt-get install -y libraw-dev zlib1g-dev libjxl-dev ninja-build
 
       # zlib comes with the macOS SDK.
-      - name: Install LibRaw (macOS)
+      - name: Install LibRaw and libjxl (macOS)
         if: runner.os == 'macOS'
-        run: brew install libraw ninja
+        run: brew install libraw jpeg-xl ninja
 
-      - name: Install LibRaw and zlib (Windows)
+      - name: Install LibRaw, zlib and libjxl (Windows)
         if: runner.os == 'Windows'
-        run: vcpkg install libraw:x64-windows zlib:x64-windows
+        run: vcpkg install libraw:x64-windows zlib:x64-windows libjxl:x64-windows
 
-      - name: Configure (Linux, macOS)
-        if: runner.os != 'Windows'
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDNGCONV_JXL=ON
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Configure (Windows)
@@ -53,3 +60,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Report what was built
+        shell: bash
+        run: |
+          exe=build/dngconv
+          [ -f build/Release/dngconv.exe ] && exe=build/Release/dngconv.exe
+          "$exe" --version
+          if "$exe" --version | grep -q "JPEG XL: not in this build"; then
+            echo "::warning::dngconv was built without JPEG XL on $RUNNER_OS: libjxl was not found or could not be linked (see the Configure step)"
+          fi

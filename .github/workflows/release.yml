@@ -26,9 +26,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # LibRaw and its dependencies are built from source by vcpkg and linked
-  # statically, so the binaries need nothing installed. This is the vcpkg
-  # revision used; change it to pick up a newer LibRaw (more cameras).
+  # LibRaw, libjxl and their dependencies are built from source by vcpkg and
+  # linked statically, so the binaries need nothing installed. This is the
+  # vcpkg revision used; change it to pick up a newer LibRaw (more cameras).
   VCPKG_COMMIT: 264e86adc7ed96c8cbfae64c1ff98bd833870ae7
   VCPKG_DISABLE_METRICS: "1"
 
@@ -130,8 +130,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkgconf || true
 
-      - name: Build LibRaw and zlib
-        run: ./vcpkg/vcpkg install "libraw:$TRIPLET" "zlib:$TRIPLET" --clean-after-build
+      # libjxl (JPEG XL compression) is optional to the build: if it cannot
+      # be linked on a platform, that package is made without it and the
+      # Package step says so in a warning.
+      - name: Build LibRaw, zlib and libjxl
+        run: ./vcpkg/vcpkg install "libraw:$TRIPLET" "zlib:$TRIPLET" "libjxl:$TRIPLET" --clean-after-build
 
       - name: Configure
         run: >
@@ -154,6 +157,9 @@ jobs:
           exe=build/dngconv
           [ -f build/Release/dngconv.exe ] && exe=build/Release/dngconv.exe
           "$exe" --version
+          if "$exe" --version | grep -q "JPEG XL: not in this build"; then
+            echo "::warning::The $RUNNER_OS package has no JPEG XL compression: libjxl was not found or could not be linked (see the Configure step)"
+          fi
 
           mkdir -p "$PACKAGE/licenses"
           cp "$exe" README.md LICENSE "$PACKAGE/"
