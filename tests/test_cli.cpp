@@ -25,6 +25,7 @@
 
 #include "dng_writer.hpp"
 #include "test_util.hpp"
+#include "tiff_builder.hpp"
 #include "tiff_reader.hpp"
 
 using namespace dngconv;
@@ -251,6 +252,40 @@ int main(int argc, char** argv) {
             CHECK(contains(r.out, "a.dng ->") && contains(r.err, "b.dng") && contains(r.err, "separate folders"));
             CHECK(fs::file_size(gDir / "twins" / "same.raw") == 5000 + 100);
         }
+    }
+
+    // ---- camera profiles: described with -i, refused when unusable --------------------------
+    {
+        namespace tb = tiffbuilder;
+        tb::Bytes dcp = {'I', 'I', 0x52, 0x43, 8, 0, 0, 0};
+        tb::placeDirectory(dcp, 8,
+                           {tb::ascii(50708, "Testmake Model T"),
+                            tb::rationals(50721, {0.9, -0.3, -0.1, -0.4, 1.2, 0.2, -0.05, 0.2, 0.7}),
+                            tb::shorts(50778, {21}, false, 3), tb::ascii(50936, "Test Standard"),
+                            tb::longs(50941, {1})});
+        const fs::path profile = tb::writeFile(gDir, "standard.dcp", dcp);
+
+        Run r = run("-i " + quoted(profile));
+        CHECK(r.status == 0);
+        CHECK(contains(r.out, "profile       Test Standard"));
+        CHECK(contains(r.out, "for camera    Testmake Model T"));
+        CHECK(contains(r.out, "one illuminant (D65)"));
+        CHECK(contains(r.out, "embed if used"));
+
+        // A profile is not a picture to convert.
+        r = run(quoted(profile));
+        CHECK(r.status == 1 && contains(r.err, "--profile"));
+        CHECK(!fs::exists(gDir / "standard.dng"));
+
+        // Profiles that cannot be used stop the run before anything is converted.
+        r = run("--profile " + quoted(gDir / "missing.dcp") + " " + quoted(profile));
+        CHECK(r.status == 1 && contains(r.err, "no such file"));
+        r = run("--profile " + quoted(gDir / "in" / "shot00.dng") + " " + quoted(profile));
+        CHECK(r.status == 1 && contains(r.err, "TIFF or DNG"));
+        r = run("--profile " + quoted(gDir / "twins") + " " + quoted(profile));
+        CHECK(r.status == 1 && contains(r.err, "no camera profiles"));
+        r = run("--profile");
+        CHECK(r.status == 2);
     }
 
     fs::remove_all(gDir, ec);

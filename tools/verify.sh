@@ -24,6 +24,8 @@
 #   metadata     compare_metadata.py              (ExifTool, Python) report only, see metadata.txt
 #   lens         compare_camera_jpeg.py           (dng_validate, Python) corrected geometry matches
 #                                                 the camera's JPEG, for files with a distortion opcode
+#   profiles     dngconv --profile, compare_profile.py   (Python; only with PROFILES set) every
+#                                                 embedded camera profile equals its .dcp file
 #
 # Steps whose tools are missing are skipped and say so. The exit status is 0
 # if no step failed.
@@ -33,6 +35,8 @@
 #   DNG_VALIDATE  Adobe's validator (default: dng_validate on the PATH); build
 #                 it with tools/dng-validate/build.sh
 #   PYTHON        the Python to use (default: python3)
+#   PROFILES      a folder of camera profiles (.dcp) to embed and compare;
+#                 without it the profiles step is skipped
 set -u
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -255,6 +259,46 @@ if [ "$have_python" = yes ] && [ "$have_exiftool" = yes ] && [ -n "$validator" ]
     fi
 else
     skipped lens "needs dng_validate, ExifTool and Python with opencv"
+fi
+
+# ---- camera profiles -------------------------------------------------------------
+profiles=${PROFILES:-}
+if [ -z "$profiles" ] || [ ! -d "$profiles" ]; then
+    skipped profiles "set PROFILES to a folder of camera profiles (.dcp) to run this step"
+elif [ "$any_python" != yes ]; then
+    skipped profiles "Python not found"
+else
+    "$dngconv" --profile "$profiles" -r -o "$work/profiled" "$raws" >"$work/profiles.log" 2>"$work/profiles.err"
+    grep ', profile: ' "$work/profiles.log" >"$work/profiles.list" || true
+    without=$(grep -c 'profiles\{0,1\} given is for' "$work/profiles.err")
+    if [ -s "$work/profiles.list" ]; then
+        : >"$work/profiles.cmp"
+        good=0
+        bad=0
+        while IFS= read -r line; do
+            rest=${line#* -> }
+            dng=${rest%%  (*}
+            ok=yes
+            "$python" "$here/compare_profile.py" "$profiles" "$dng" >>"$work/profiles.cmp" 2>&1 || ok=no
+            if [ -n "$validator" ] && [ -x "$validator" ]; then
+                report=$("$validator" "$dng" 2>&1)
+                case $report in
+                    *'*** Error'* | *'Unable to parse extra camera profile'*) ok=no ;;
+                    *'Validation complete'*) ;;
+                    *) ok=no ;;
+                esac
+                [ "$ok" = yes ] || printf '%s\n' "$report" >>"$work/profiles.cmp"
+            fi
+            if [ "$ok" = yes ]; then good=$((good + 1)); else bad=$((bad + 1)); fi
+        done <"$work/profiles.list"
+        if [ "$bad" -eq 0 ]; then
+            passed profiles "$good DNGs carry the profiles made for their camera, value for value ($without files from cameras the folder has none for; see profiles.cmp)"
+        else
+            failed profiles "$bad of $((good + bad)) DNGs; see $work/profiles.cmp"
+        fi
+    else
+        failed profiles "no profile in the folder fits any of the cameras; see $work/profiles.err"
+    fi
 fi
 
 echo

@@ -25,6 +25,7 @@
 #include <shellapi.h>
 #endif
 
+#include "camera_profile.hpp"
 #include "dng_check.hpp"
 #include "dng_writer.hpp"
 #include "job_runner.hpp"
@@ -47,6 +48,8 @@ struct Settings {
     bool embedOriginal = false;
     LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
     bool sidecar = true;
+    std::vector<std::string> profiles;  // .dcp files and folders of them
+    bool profileAnyCamera = false;
     bool recursive = false;
     bool force = false;
     bool update = false;
@@ -88,6 +91,11 @@ const char* const kUsage =
     "                            set to apply), all, or none\n"
     "      --no-sidecar          do not take over an XMP sidecar file (IMG.xmp or\n"
     "                            IMG.CR3.xmp next to IMG.CR3)\n"
+    "      --profile <path>      embed camera profiles: a .dcp file, or a folder\n"
+    "                            that is searched for them. Each picture gets\n"
+    "                            the profiles made for its camera, the first\n"
+    "                            given as its default. May be repeated\n"
+    "      --profile-any-camera  embed the profiles whatever camera they name\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -f, --force               overwrite existing DNG files\n"
     "  -u, --update              skip files whose DNG exists and is not older than\n"
@@ -287,6 +295,12 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
             if (!parseCount(args, i, "dngconv", s.parallel)) return false;
         } else if (a == "--no-sidecar") {
             s.sidecar = false;
+        } else if (a == "--profile") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            s.profiles.push_back(*v);
+        } else if (a == "--profile-any-camera") {
+            s.profileAnyCamera = true;
         } else if (a == "-u" || a == "--update") {
             s.update = true;
         } else if (a == "-t" || a == "--keep-times") {
@@ -395,7 +409,24 @@ std::string fitQuality(const LensOpcodes& lens) {
     return out;
 }
 
-void printInfo(const fs::path& path, const RawReadResult& r, LensCorrectionMode lensMode) {
+// What a camera profile file holds.
+void printProfile(const fs::path& path, const CameraProfile& p) {
+    static const char* const policies[] = {"copying allowed", "embed if used", "never embed",
+                                           "no restrictions"};
+    std::printf("%s\n", show(path).c_str());
+    std::printf("  profile       %s\n", p.name.empty() ? "(unnamed)" : p.name.c_str());
+    if (!p.groupName.empty()) std::printf("  group         %s\n", p.groupName.c_str());
+    std::printf("  for camera    %s\n", p.cameraModel.empty() ? "any" : p.cameraModel.c_str());
+    std::printf("  contents      %s\n", p.summary().c_str());
+    if (!p.copyright.empty()) std::printf("  copyright     %s\n", p.copyright.c_str());
+    std::printf("  embedding     %s\n", p.embedPolicy < 4 ? policies[p.embedPolicy] : "unknown policy");
+    if (p.dngVersion > 0x0104)
+        std::printf("  note          uses tags of DNG %u.%u\n", p.dngVersion >> 8, p.dngVersion & 0xff);
+}
+
+void printInfo(const fs::path& path, const RawReadResult& r, const Settings& settings,
+               const ProfileLibrary& library) {
+    const LensCorrectionMode lensMode = settings.lensCorrections;
     const RawImage& img = r.image;
     std::printf("%s\n", show(path).c_str());
     std::printf("  camera        %s\n", img.uniqueCameraModel.c_str());
@@ -476,6 +507,18 @@ void printInfo(const fs::path& path, const RawReadResult& r, LensCorrectionMode 
     }
     if (!img.xmpSidecarName.empty())
         std::printf("  sidecar       %s (%zu bytes of XMP)\n", img.xmpSidecarName.c_str(), img.xmpSidecar.size());
+    if (!library.empty() && img.colorPlanes >= 3) {
+        std::vector<std::string> notes;
+        const auto chosen = library.select(img.uniqueCameraModel, img.colorPlanes,
+                                           settings.profileAnyCamera, notes);
+        if (chosen.empty())
+            std::printf("  profile       none of the %zu given is for this camera\n", library.size());
+        for (size_t i = 0; i < chosen.size(); ++i)
+            std::printf("  %s %s (%s): %s\n", i == 0 ? "profile      " : "also offered ",
+                        chosen[i]->displayName().c_str(), chosen[i]->fileName.c_str(),
+                        chosen[i]->summary().c_str());
+        for (const auto& note : notes) std::printf("  note          %s\n", note.c_str());
+    }
     if (r.sourceIsDng) {
         std::printf("  note          this file already is a DNG\n");
         try {
@@ -848,6 +891,29 @@ int main(int argc, char** argv) {
     int exitCode = 2;
     if (!parseArguments(args, settings, exitCode)) return exitCode;
 
+    // ---- camera profiles ---------------------------------------------------------
+    ProfileLibrary library;
+    for (const std::string& given : settings.profiles) {
+        std::vector<std::string> skipped;
+        const size_t before = library.size();
+        try {
+            library.add(fs::u8path(given), skipped);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "dngconv: --profile: %s\n", e.what());
+            return 1;
+        }
+        for (const auto& why : skipped)
+            std::fprintf(stderr, "dngconv: warning: profile left out: %s\n", why.c_str());
+        std::error_code ec;
+        if (library.size() == before && skipped.empty() && fs::is_directory(fs::u8path(given), ec))
+            std::fprintf(stderr, "dngconv: warning: no camera profiles (.dcp) found in '%s'\n",
+                         given.c_str());
+    }
+    if (!settings.profiles.empty() && library.empty()) {
+        std::fprintf(stderr, "dngconv: --profile: no usable camera profile was given\n");
+        return 1;
+    }
+
     std::vector<Job> jobs;
     bool anyFolder = false;
     bool allFound = collectJobs(settings, rawExtensions(), jobs, anyFolder);
@@ -861,10 +927,14 @@ int main(int argc, char** argv) {
         int failures = allFound ? 0 : 1;
         for (const Job& job : jobs) {
             try {
+                if (lowerExtension(job.input) == ".dcp") {
+                    printProfile(job.input, readCameraProfile(job.input));
+                    continue;
+                }
                 RawReadOptions ro;
                 ro.metadataOnly = true;
                 ro.loadPreview = false;
-                printInfo(job.input, readRaw(job.input, ro), settings.lensCorrections);
+                printInfo(job.input, readRaw(job.input, ro), settings, library);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "dngconv: %s: %s\n", show(job.input).c_str(), e.what());
                 ++failures;
@@ -952,6 +1022,9 @@ int main(int argc, char** argv) {
                 }
             }
 
+            if (lowerExtension(job.input) == ".dcp")
+                throw std::runtime_error("a camera profile, not a picture; give it with --profile");
+
             const auto started = std::chrono::steady_clock::now();
             RawReadOptions ro;
             ro.loadPreview = settings.preview;
@@ -966,7 +1039,26 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("cannot create folder '" +
                                              show(target.parent_path()) + "': " + ec.message());
             }
-            writeDng(source.image, target, writeOptions);
+            // The profiles made for this camera, out of those given.
+            DngWriteOptions options = writeOptions;
+            if (!library.empty() && source.image.colorPlanes >= 3) {
+                options.profiles = library.select(source.image.uniqueCameraModel, source.image.colorPlanes,
+                                                  settings.profileAnyCamera, source.warnings);
+                if (options.profiles.empty())
+                    source.warnings.push_back(
+                        format("none of the %zu profile%s given is for '%s'; the DNG keeps the "
+                               "decoder's colour matrix",
+                               library.size(), library.size() == 1 ? "" : "s",
+                               source.image.uniqueCameraModel.c_str()));
+            }
+            std::string profileNote;
+            if (!options.profiles.empty()) {
+                profileNote = ", profile: " + options.profiles.front()->displayName();
+                if (options.profiles.size() > 1)
+                    profileNote += format(" + %zu more", options.profiles.size() - 1);
+            }
+
+            writeDng(source.image, target, options);
             if (settings.verify) verifyOutput(source.image, target);
             const LensOpcodes lens = makeLensOpcodes(source.image, settings.lensCorrections);
             for (const auto& note : lens.notes) source.warnings.push_back(note);
@@ -983,10 +1075,11 @@ int main(int argc, char** argv) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
                 const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
-                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s)\n", name.c_str(),
+                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s)\n", name.c_str(),
                                     show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                                     megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
                                     lens.any() ? ", lens: " : "", lens.summary().c_str(),
+                                    profileNote.c_str(),
                                     sidecar ? ", with " : "",
                                     sidecar ? source.image.xmpSidecarName.c_str() : "",
                                     settings.verify ? (settings.embedOriginal

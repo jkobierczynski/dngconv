@@ -71,6 +71,11 @@ public:
     /// Tag whose value is the file offset of one or more child IFDs.
     void setSubIfds(uint16_t tag, const std::vector<TiffIfd*>& children);
 
+    /// Tag whose value is the file offsets of self-contained blocks of bytes
+    /// stored elsewhere in the file (DNG ExtraCameraProfiles: each block is a
+    /// little TIFF-like structure of its own).
+    void setBlocks(uint16_t tag, std::vector<std::vector<uint8_t>> blocks);
+
     /// Image data: one chunk per strip or tile. Writes the offsets tag and the
     /// byte-counts tag.
     void setChunks(uint16_t offsetsTag, uint16_t byteCountsTag,
@@ -87,6 +92,8 @@ private:
         std::vector<uint8_t> data;          // little-endian payload
         std::vector<TiffIfd*> children;     // payload = offsets of these IFDs
         bool chunkOffsets = false;          // payload = offsets of chunks_
+        std::vector<std::vector<uint8_t>> blocks;  // payload = offsets of these
+        std::vector<uint64_t> blockOffsets;        // layout result
         bool pinned = false;                // value wants a fixed file offset
         uint64_t pinOffset = 0;
         bool pinGranted = false;            // layout result

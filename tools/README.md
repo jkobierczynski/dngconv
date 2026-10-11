@@ -28,6 +28,7 @@ there is a tool for:
   ok       render    14 pairs develop to the same picture (notes: 2, ...; see render.log)
   ok       metadata  report written to .../metadata.txt (for reading; nothing is judged)
   ok       lens      4 files with a distortion opcode match their camera JPEG (see lens.log)
+  ok       profiles  9 DNGs carry the profiles made for their camera, value for value (...)
 
 all steps that ran passed
 ```
@@ -50,9 +51,12 @@ is 0 if no step that ran failed.
 | render | Source and DNG develop to the same picture: pattern, levels, white balance and matrix are described correctly | Python, rawpy |
 | metadata | A report of which tags survive, for reading | ExifTool, Python |
 | lens | The DNG, developed with its lens opcodes, has the geometry of the camera's own JPEG | `dng_validate`, ExifTool, Python, OpenCV |
+| profiles | Converted again with `--profile`, each DNG holds the profiles of its camera exactly as the `.dcp` files have them, and Adobe's reader parses them. Runs only when `PROFILES` names a folder of profiles | Python; `dng_validate` if present |
 
 Environment variables: `DNGCONV` (the program under test; default
-`build/dngconv`), `DNG_VALIDATE`, `PYTHON`.
+`build/dngconv`), `DNG_VALIDATE`, `PYTHON`, and `PROFILES` (a folder of
+camera profiles for the last step; RawTherapee's `rtdata/dcpprofiles` is a
+freely available one).
 
 ## Setting up
 
@@ -128,6 +132,12 @@ it what the DNG's opcode will remove. It needs a detailed picture taken at
 low ISO.
 
 **`matching.py`** is the point matching the two lens scripts share.
+
+**`compare_profile.py PROFILE_FOLDER DNG_FILE...`** reads the camera profile
+tags of each DNG, and each of its extra profile blocks, with a few lines of
+its own TIFF parsing, and looks for a `.dcp` file in the folder with the same
+tags, types and values. Byte order is evened out; the camera name inside the
+`.dcp` is not compared, since dngconv does not embed it.
 
 ## What these tools do not replace
 

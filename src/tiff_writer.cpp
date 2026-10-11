@@ -193,6 +193,15 @@ void TiffIfd::setSubIfds(uint16_t tag, const std::vector<TiffIfd*>& children) {
     entries_[tag] = std::move(e);
 }
 
+void TiffIfd::setBlocks(uint16_t tag, std::vector<std::vector<uint8_t>> blocks) {
+    Entry e;
+    e.type = TiffType::Long;
+    e.count = static_cast<uint32_t>(blocks.size());
+    e.data.assign(blocks.size() * 4, 0);
+    e.blocks = std::move(blocks);
+    entries_[tag] = std::move(e);
+}
+
 void TiffIfd::setChunks(uint16_t offsetsTag, uint16_t byteCountsTag,
                         std::vector<std::vector<uint8_t>> chunks) {
     chunks_ = std::move(chunks);
@@ -255,6 +264,7 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
         for (const auto& [tag, e] : ifd->entries_) {
             (void)tag;
             if (e.data.size() > 4) naturalSize += evenSize(e.data.size());
+            for (const auto& block : e.blocks) naturalSize += evenSize(block.size());
         }
         for (const auto& chunk : ifd->chunks_) naturalSize += evenSize(chunk.size());
     }
@@ -316,6 +326,13 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
         ifd->chunkOffsets_.clear();
         for (const auto& chunk : ifd->chunks_) ifd->chunkOffsets_.push_back(allocate(chunk.size()));
     }
+    for (auto& ifd : ifds_) {
+        for (auto& [tag, e] : ifd->entries_) {
+            (void)tag;
+            e.blockOffsets.clear();
+            for (const auto& block : e.blocks) e.blockOffsets.push_back(allocate(block.size()));
+        }
+    }
     for (TiffIfd::Entry* e : deferred) e->valueOffset = allocate(e->data.size());
     uint64_t fileEnd = cursor;
     for (const Span& f : fixed) fileEnd = std::max(fileEnd, evenSize(f.end));
@@ -333,6 +350,9 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
                         throw std::runtime_error("sub-IFD is not part of this TIFF");
                     put32(e.data, static_cast<uint32_t>(child->offset_));
                 }
+            } else if (!e.blocks.empty()) {
+                e.data.clear();
+                for (uint64_t off : e.blockOffsets) put32(e.data, static_cast<uint32_t>(off));
             } else if (e.chunkOffsets) {
                 e.data.clear();
                 for (uint64_t off : ifd->chunkOffsets_)
@@ -395,6 +415,8 @@ void TiffWriter::write(std::ostream& out, bool bigEndian) {
             } else {
                 for (size_t k = 0; k < 4; ++k) table.push_back(k < value->size() ? (*value)[k] : 0);
             }
+            for (size_t k = 0; k < e.blocks.size(); ++k)
+                pieces.push_back({e.blockOffsets[k], &e.blocks[k]});
         }
         put32o(table, 0);  // no next IFD: children hang off SubIFDs instead
         pieces.push_back({ifd.offset_, &table});

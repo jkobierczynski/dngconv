@@ -7,7 +7,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <memory>
 #include <string>
+#include <vector>
+
+#include "camera_profile.hpp"
 
 #include "lens_opcodes.hpp"
 #include "raw_image.hpp"
@@ -55,6 +59,12 @@ struct DngWriteOptions {
     /// Store RawImage::xmpSidecar, when it is not empty, as the DNG's XMP
     /// metadata, in place of any XMP the source file itself held.
     bool xmpSidecar = true;
+    /// Camera profiles to store in the DNG. The first becomes the profile of
+    /// the file and takes the place of the decoder's plain colour matrix; the
+    /// others are stored next to it for the raw developer to offer
+    /// (ExtraCameraProfiles). Each must describe as many colour planes as the
+    /// image has. Ignored for monochrome images.
+    std::vector<std::shared_ptr<const CameraProfile>> profiles;
     DngByteOrder byteOrder = DngByteOrder::MatchSource;
     /// Value of the TIFF Software tag.
     std::string software = "dngconv";

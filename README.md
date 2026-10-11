@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.6.1, early**. It works on the cameras listed under
+Status: **0.7.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -19,7 +19,10 @@ Status: **0.6.1, early**. It works on the cameras listed under
 - Lossless JPEG compression in tiles (the standard DNG scheme), compressed on
   all CPU cores, or uncompressed output.
 - Bayer sensors, Fuji X-Trans, and full-colour raws such as Canon sRAW.
-- Colour: calibrated matrix (D65) and as-shot white balance.
+- Colour: calibrated matrix (D65) and as-shot white balance, or the **camera
+  profiles** you choose (`--profile`): DCP files such as Adobe Standard, the
+  camera-look profiles or one made from a colour chart are stored in the DNG,
+  matched to each picture's camera. See [Camera profiles](#camera-profiles).
 - Metadata: the camera's complete EXIF and GPS directories and its maker
   note are carried over, read directly from the source file. Maker and model
   keep the camera's own spelling.
@@ -93,6 +96,7 @@ dngconv -r -u -t -o ~/dng ~/photos    # the same again later: only what is new
 dngconv --verify -o safe.dng shot.ARW # convert, then prove nothing was lost
 dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
 dngconv --lens-corrections none *.ARW # leave the lens corrections out
+dngconv --profile ~/profiles *.CR3    # embed the camera profiles that fit
 dngconv -i shot.RAF                   # show what the decoder finds
 ```
 
@@ -109,6 +113,11 @@ dngconv -i shot.RAF                   # show what the decoder finds
                             set to apply), all, or none
       --no-sidecar          do not take over an XMP sidecar file (IMG.xmp or
                             IMG.CR3.xmp next to IMG.CR3)
+      --profile <path>      embed camera profiles: a .dcp file, or a folder
+                            that is searched for them. Each picture gets
+                            the profiles made for its camera, the first
+                            given as its default. May be repeated
+      --profile-any-camera  embed the profiles whatever camera they name
   -r, --recursive           descend into sub-folders
   -f, --force               overwrite existing DNG files
   -u, --update              skip files whose DNG exists and is not older than
@@ -261,7 +270,7 @@ What it covers, and what it cannot:
 
 ## What has been tested
 
-Each file below was converted and then checked in up to seven ways:
+Each file below was converted and then checked in up to eight ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -288,6 +297,12 @@ Each file below was converted and then checked in up to seven ways:
    developed by Adobe's code and by darktable, with the opcodes applied, and
    the result laid over the JPEG the camera itself made of the same shot. See
    [Lens corrections](#lens-corrections) for the numbers.
+
+8. **Camera profiles** (the nine files whose camera has a profile among
+   RawTherapee's open ones): every profile tag in the DNG equals the one in
+   the `.dcp` file, and Adobe's code develops the DNG exactly as it develops
+   a reference in which ExifTool wrote the same profile. See
+   [Camera profiles](#camera-profiles).
 
 | Camera | Format | Sensor data | Source | DNG | Rendering difference |
 |---|---|---|---:|---:|---|
@@ -503,6 +518,86 @@ thumbnail in the DNG is rendered without the corrections.
 own; DNG wants polynomials. The fit is reported for every file (`-i`, see
 above) and stayed below 0.4 pixels and 0.5 % brightness on the samples.
 
+## Camera profiles
+
+A DNG tells its reader how the camera sees colour with a *camera profile*.
+Left alone, dngconv writes the plainest one there is: a single matrix for
+daylight, from LibRaw's camera table. Raw developers can do better with a
+full profile: matrices for two light sources, hue and saturation tables, a
+tone curve. "Adobe Standard" is such a profile, so are the ones that imitate
+a camera's picture styles, and so is a profile made from a photograph of a
+colour chart. They are files with the extension `.dcp`, and `--profile`
+stores them in the DNG, where they travel with the picture:
+
+```sh
+dngconv --profile "Canon EOS R8 Adobe Standard.dcp" IMG_0036.CR3
+dngconv --profile ~/dcp/standard --profile ~/dcp/looks -r -o ~/dng ~/photos
+dngconv -i --profile ~/dcp IMG_0036.CR3    # which profiles this file would get
+dngconv -i "Canon EOS R8 Adobe Standard.dcp"   # what a profile file holds
+```
+
+**Which picture gets which profile.** Every profile names the camera it was
+made for, and each picture gets the profiles made for its camera; a profile
+that names none fits all. Case, spaces and punctuation are ignored in the
+comparison ("OLYMPUS E-M10" is "Olympus E-M10"). A folder holding profiles
+for many cameras can therefore be given for a mixed batch. A file from a
+camera without a profile is converted as before, and dngconv says so.
+
+**Default and alternatives.** The first profile that fits, in the order the
+options were given and by path within a folder, becomes *the* profile of the
+DNG: it takes the place of the decoder's matrix and is what a raw developer
+uses unless told otherwise. The others are stored next to it
+(`ExtraCameraProfiles`) for the developer to offer in its profile menu. Two
+profiles with the same name cannot both be offered; the first is kept.
+
+**When the names differ.** LibRaw and the maker of a profile do not always
+spell a camera the same way, and some cameras are sold under two names.
+`-i` shows both spellings: the `camera` line of a raw file, the `for camera`
+line of a profile. `--profile-any-camera` embeds the profiles given whatever
+they name. Use it with files from one camera only: a profile for another
+sensor gives wrong colours, and nothing in the file will say why.
+
+**What is respected.** A profile marked "never embed" by its maker is left
+out, with a note. Copyright notice and embed policy are carried along. A
+profile for a different kind of sensor (four colours instead of three) is
+left out as well.
+
+**Where profiles come from.** Adobe's are installed with its free DNG
+Converter and with Camera Raw, under `CameraRaw/CameraProfiles` in
+`C:\ProgramData\Adobe` or `/Library/Application Support/Adobe`; they are
+Adobe's, under Adobe's terms. [RawTherapee](https://rawtherapee.com/) ships
+open ones for some 160 cameras (`rtdata/dcpprofiles` in its source). The
+free [dcamprof](https://torger.se/anders/dcamprof.html) and the software
+that comes with colour charts make profiles for your own camera and light.
+None are included here.
+
+**What was checked.** For nine sample files and RawTherapee's profiles:
+every profile tag read back from the DNG with ExifTool equals the one in the
+`.dcp` file; Adobe's `dng_validate` develops the DNG to exactly the picture
+it develops from a reference made the other way round (the same DNG without
+a profile, the profile's tags then written into it by ExifTool), for four
+cameras, pixel for pixel; extra profiles are parsed by Adobe's reader, in
+little- and big-endian files, and are still there after its writer has
+rewritten the DNG. `tools/compare_profile.py` repeats the first comparison
+without ExifTool.
+
+**What to expect.**
+
+- Not seen in Lightroom or Camera Raw: that the profiles appear in the menu
+  there is what the format promises and what Adobe's reader code does, but
+  nobody has looked.
+- Adobe's own profiles are tuned for DNGs from Adobe's converter, which
+  carry a per-camera brightness offset (`BaselineExposure`) that dngconv
+  does not know. With them a picture can come out somewhat lighter or
+  darker than from an Adobe-made DNG.
+- Software built on LibRaw or rawspeed (darktable, RawTherapee) reads the
+  matrices and ignores tables and curves in a DNG. RawTherapee can load the
+  `.dcp` file itself.
+- The thumbnail is rendered with the decoder's matrix, as before.
+- Profiles add their size to every file: from a few kilobytes for matrices
+  alone to about a megabyte with a look table. Ten of the latter are 10 MB
+  per picture.
+
 ## Things worth knowing
 
 **Defect pixels.** Panasonic cameras (and a few others) mark dead pixels by
@@ -544,10 +639,12 @@ is the safer choice for highlight recovery, but it can make a DNG render a
 little brighter than the same file developed from the original by software
 that assumes the format maximum.
 
-**Colour.** There is one colour matrix, for daylight (D65), taken from LibRaw's
-camera table. Adobe's converter ships two matrices per camera plus tone and
-look profiles; colours in Adobe software will therefore not be identical to
-those of an Adobe-made DNG. For cameras missing from LibRaw's table the matrix
+**Colour.** Without `--profile` there is one colour matrix, for daylight
+(D65), taken from LibRaw's camera table. Adobe's converter ships two matrices
+per camera plus tone and look profiles; colours in Adobe software will
+therefore not be identical to those of an Adobe-made DNG. Embedding the
+profile you want closes most of that gap, see
+[Camera profiles](#camera-profiles). For cameras missing from LibRaw's table the matrix
 is derived from LibRaw's built-in camera-to-sRGB matrix, and dngconv says so.
 
 **What LibRaw decides.** Active area, black level and the colour matrix
@@ -570,7 +667,8 @@ newer LibRaw.
   multi-frame files beyond their first frame (pixel shift, dual exposure).
 - Sigma X3F works only if your LibRaw was built with X3F support; most
   distribution packages are not.
-- A second calibration illuminant, DNG 1.6/1.7 features (JPEG XL compression
+- A second calibration illuminant of dngconv's own (a profile given with
+  `--profile` brings its own), DNG 1.6/1.7 features (JPEG XL compression
   among them).
 - A JPEG preview for cameras whose files carry none (only the thumbnail is
   written then), and re-rendering previews at a chosen size.
@@ -588,17 +686,18 @@ newer LibRaw.
 | `src/lens_correction.hpp` | Lens corrections as curves over the radius, independent of the maker |
 | `src/lens_data.*` | Reads each maker's lens-correction parameters into those curves |
 | `src/lens_opcodes.*` | Fits the curves to DNG's polynomials and builds the opcode list |
+| `src/camera_profile.*` | Reads camera profiles (`.dcp`), picks those that fit a camera, packs them for the DNG |
 | `src/thumbnail.*` | Renders the small RGB thumbnail from the raw data |
 | `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/dng_digest.*` | The two raw image digests DNG defines |
 | `src/dng_check.*` | Reads a DNG's raw data as stored and compares the file with its checksums |
 | `src/parallel.hpp` | Runs a job list on all cores |
-| `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset |
+| `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset and blocks addressed by offset |
 | `src/sidecar.*` | Finds and reads XMP sidecar files |
 | `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, the program itself run on generated DNGs, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.
@@ -613,5 +712,7 @@ in `TODO.md`.
 
 GPL-3.0-or-later, see `LICENSE`.
 
-LibRaw is used under the LGPL 2.1, zlib under the zlib licence. DNG is a format published by Adobe; this
+LibRaw is used under the LGPL 2.1, zlib under the zlib licence. Camera
+profiles are not part of dngconv; a profile you embed keeps the licence its
+maker gave it. DNG is a format published by Adobe; this
 project is not affiliated with or endorsed by Adobe.

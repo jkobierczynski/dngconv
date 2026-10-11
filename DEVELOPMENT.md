@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.6.1.
+Last updated: 2026-10-11, at version 0.7.0.
 
 ## Status at a glance
 
@@ -15,6 +15,7 @@ Last updated: 2026-10-11, at version 0.6.1.
 | DNG writing (own TIFF writer, lossless JPEG) | Working, both byte orders |
 | Pixel fidelity | Bit-exact on all 15 sample files |
 | Colour (matrix, white balance, levels) | Working, one illuminant (D65) |
+| Camera profiles (`--profile`) | Working: DCP files embedded as main and extra profiles; identical renders to an ExifTool-made reference in Adobe's code |
 | EXIF and GPS copy | Working for TIFF-based raws, CR3, RAF, RW2 |
 | Maker notes | Copied, stored twice; verified with ExifTool and exiv2 |
 | Previews | Standard layout: rendered thumbnail in IFD0, raw image and camera JPEG in sub-directories |
@@ -356,6 +357,56 @@ rawpy (the damaged Canon file), four files have a distortion opcode and
 match their camera JPEG. It was also run on a folder with spaces in file
 and folder names, and with the validator and Python missing or broken.
 
+### 0.7.0 (2026-10-11): camera profiles
+
+1. **`--profile <file or folder>`** (repeatable) and
+   **`--profile-any-camera`**. Each picture gets the DCP profiles whose
+   `UniqueCameraModel` is its camera (letters and digits compared, nothing
+   else). The first becomes the profile of the file: its tags go into IFD0
+   in place of the decoder's `ColorMatrix1`. The others follow in
+   `ExtraCameraProfiles`.
+2. **`camera_profile.*`**: a bounds-checked parser for the DCP container (a
+   TIFF with the magic number 0x4352), a table of the 34 tags that make up a
+   profile in DNG 1.4, 1.6 and 1.7 with the type each must have, consistency
+   checks (matrix sizes against the number of colours, table sizes against
+   their dimensions, invertible matrix, finite numbers), and the packer for
+   extra-profile blocks.
+3. **`-i`** describes a `.dcp` file, and with `--profile` lists the profiles
+   a raw file would get. `TiffIfd::setBlocks` stores blocks addressed by
+   offset. `tools/compare_profile.py` and a `profiles` step in `verify.sh`
+   (run when `PROFILES` names a folder).
+
+How it was verified, with RawTherapee's 161 open profiles (159 distinct)
+and the 15 samples, nine of which have a profile among them:
+
+| Check | Result |
+|---|---|
+| Every profile tag of the nine DNGs read with ExifTool and compared with the `.dcp` file | Equal, large tables included |
+| Adobe `dng_validate` on all 15 DNGs | No error, no new warning; `-v` lists the main profile and each extra profile with its tables |
+| The render test: `dng_validate -tif` on our DNG, and on a reference made by letting ExifTool write the profile's tags into the profile-less DNG | Maximum difference 0 for Sony ILCE-7M3, Canon EOS R8, Olympus E-M10 and Canon EOS 40D (sRAW). Against the DNG without profile the mean difference is 1.5 to 8 of 255, so the profile is in use |
+| Extra profiles | Parsed by Adobe's reader in a little-endian and a big-endian (Nikon) DNG; still present after `dng_validate -dng` rewrote the file; blocks equal to the `.dcp` files tag for tag |
+| LibRaw 0.22 (rawpy) on a DNG with a two-illuminant profile | Develops; it takes the profile's matrices |
+| Parser under ASan and UBSan | 18,000 mutated copies of three profiles: 5,359 accepted, the rest refused, no finding |
+
+Decisions:
+
+- **The camera model inside a profile is not embedded.** Adobe's reader
+  treats it as a restriction ("only for this model"). Inside a DNG the
+  profile has already been matched, and our spelling of the model may differ
+  from the profile's in case or spacing; a restriction could only hide it.
+- **Tags are carried, not interpreted.** Values go from the `.dcp` to the
+  DNG untouched (integer tags are widened to the type the specification
+  names). Tags that are not part of a profile are dropped. A profile that
+  fails a consistency check is refused as a whole instead of repaired.
+- **"Never embed" is obeyed, "embed if used" is read as permission**, since
+  the profile is the one the file will be developed with.
+- **The decoder's matrix is not kept as an extra profile** when a DCP takes
+  its place. It could be, under a name of its own; nobody has asked.
+- **No Adobe profile was at hand.** The format is the same and Adobe's
+  reader parses what we write, but a `BaselineExposure` to go with Adobe's
+  profiles is not written (LibRaw has no such table), which the README
+  states.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -485,7 +536,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (10 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
+| Unit tests (11 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -497,6 +548,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
+| Camera profiles | ExifTool (tag values, and as the writer of a reference DNG), Adobe `dng_validate` (parsing, rendering, rewriting) | The embedded profile is the `.dcp` file's, and is developed as such; see the 0.7.0 history |
 | Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
 | Threads | GCC 13 thread sanitizer | Parallel conversion, checking and extraction of all samples, and the unit tests, with LibRaw's own OpenMP threads excluded |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
@@ -528,6 +580,9 @@ Not covered by any check so far:
   Adobe-made DNG with an embedded original was at hand.
 - Originals of 4 GiB or more (refused), and memory use on very large files:
   the source file and its packed copy are both held in memory.
+- Camera profiles in Lightroom's and Camera Raw's menus, Adobe's own
+  profiles (none at hand), profiles with three illuminants or the DNG 1.7
+  tables (accepted and carried, never met in a real file).
 - Lens corrections beyond the five sample files: Fuji's newer nine-knot
   tables and its cropped modes, a Sony file with shading compensation off,
   Fuji's vignetting gain (7 % in the sample, too small to confirm), and the

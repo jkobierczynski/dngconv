@@ -74,6 +74,7 @@ constexpr uint16_t AsShotNeutral = 50728;
 constexpr uint16_t CameraSerialNumber = 50735;
 constexpr uint16_t LensInfo = 50736;
 constexpr uint16_t CalibrationIlluminant1 = 50778;
+constexpr uint16_t ExtraCameraProfiles = 50933;
 constexpr uint16_t OriginalRawFileName = 50827;
 constexpr uint16_t OriginalRawFileData = 50828;
 constexpr uint16_t OriginalRawFileDigest = 50973;
@@ -399,6 +400,14 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
                            (options.byteOrder == DngByteOrder::MatchSource && withMakerNote &&
                             note.bigEndian);
 
+    const bool withProfiles = !options.profiles.empty() && img.colorPlanes >= 3;
+    if (withProfiles)
+        for (const auto& profile : options.profiles)
+            if (!profile || profile->colorPlanes != img.colorPlanes)
+                throw std::invalid_argument("camera profile '" +
+                                            (profile ? profile->displayName() : std::string("?")) +
+                                            "' does not fit the colour planes of the image");
+
     TiffWriter tiff;
     TiffIfd& ifd0 = tiff.addIfd();
 
@@ -559,7 +568,12 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     }
 
     // ---- camera and picture description (always in IFD0) ------------------------
-    ifd0.setBytes(tag::DNGVersion, {1, 4, 0, 0});
+    // 1.4, unless a profile uses tags that came later.
+    unsigned dngVersion = 0x0104;
+    if (withProfiles)
+        for (const auto& profile : options.profiles) dngVersion = std::max(dngVersion, profile->dngVersion);
+    ifd0.setBytes(tag::DNGVersion,
+                  {static_cast<uint8_t>(dngVersion >> 8), static_cast<uint8_t>(dngVersion & 0xff), 0, 0});
     // Opcode lists arrived with DNG 1.3; everything else here is 1.1 material.
     ifd0.setBytes(tag::DNGBackwardVersion, {1, static_cast<uint8_t>(hasOpcodes ? 3 : 1), 0, 0});
     ifd0.setShort(tag::Orientation, static_cast<uint16_t>(img.orientation));
@@ -588,11 +602,21 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (hasLensInfo) ifd0.setRationals(tag::LensInfo, lensInfo);
 
     if (img.colorPlanes >= 3) {
-        std::vector<double> matrix;
-        for (uint32_t p = 0; p < img.colorPlanes; ++p)
-            for (int k = 0; k < 3; ++k) matrix.push_back(img.colorMatrix[p][k]);
-        ifd0.setSRationals(tag::ColorMatrix1, matrix);
-        ifd0.setShort(tag::CalibrationIlluminant1, kIlluminantD65);
+        if (withProfiles) {
+            // The profile's own matrices, tables and curve, value for value.
+            for (const TiffField& f : options.profiles.front()->fields)
+                ifd0.setRaw(f.tag, f.type, f.count, f.data);
+            std::vector<std::vector<uint8_t>> extra;
+            for (size_t i = 1; i < options.profiles.size(); ++i)
+                extra.push_back(packCameraProfile(*options.profiles[i], bigEndian));
+            if (!extra.empty()) ifd0.setBlocks(tag::ExtraCameraProfiles, std::move(extra));
+        } else {
+            std::vector<double> matrix;
+            for (uint32_t p = 0; p < img.colorPlanes; ++p)
+                for (int k = 0; k < 3; ++k) matrix.push_back(img.colorMatrix[p][k]);
+            ifd0.setSRationals(tag::ColorMatrix1, matrix);
+            ifd0.setShort(tag::CalibrationIlluminant1, kIlluminantD65);
+        }
         if (img.hasAsShotNeutral)
             ifd0.setRationals(tag::AsShotNeutral,
                               std::vector<double>(img.asShotNeutral.begin(),

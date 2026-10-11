@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.6.1.
+Last updated: 2026-10-11, at version 0.7.0.
 
 ## Needs someone with the software or an account
 
@@ -18,6 +18,11 @@ close the largest gaps in the verification.
       the library, and what the applications make of the lens opcodes
       (whether they report a built-in profile, and how the result compares
       with their own profile for the same lens).
+- [ ] **Camera profiles in Lightroom and Camera Raw.** Convert with
+      `--profile` and two or three of Adobe's own profiles: do they all show
+      in the profile menu, is the first the default, and how does the
+      picture compare with an Adobe-made DNG of the same file (the
+      `BaselineExposure` question below)?
 - [ ] **Embedded originals and Adobe's DNG Converter**, both directions:
       extract one of ours with "Extract originals", and run `dngconv extract`
       on a DNG that Adobe's converter embedded an original in.
@@ -47,8 +52,19 @@ close the largest gaps in the verification.
       the Samsung preview directory.
 - [ ] **A JPEG preview for files that carry none**, and re-rendering previews
       at a chosen size. Needs a JPEG encoder.
-- [ ] **A second calibration illuminant** (`ColorMatrix2`, standard light A).
-      LibRaw's table has only D65; the data would have to come from elsewhere.
+- [ ] **A second calibration illuminant** (`ColorMatrix2`, standard light A)
+      for files converted without `--profile`. LibRaw's table has only D65;
+      the data would have to come from elsewhere.
+- [ ] **Camera profiles: what the first version left open.**
+      - `BaselineExposure` per camera, which Adobe's profiles are tuned for.
+        Could be taken from a profile-specific table, or from an Adobe-made
+        DNG of the same camera given as a template.
+      - A table of camera names that differ between LibRaw and Adobe, so
+        that `--profile-any-camera` is needed less often.
+      - Rendering the thumbnail (and later the preview) with the embedded
+        profile's matrices instead of the decoder's.
+      - Choosing the default profile by name (`--default-profile "Camera
+        Standard"`) instead of by order.
 - [ ] **Multi-frame files** beyond their first frame (pixel shift, dual
       exposure), **Fuji Super CCD** with the diagonal layout, and
       **floating-point raws**.
