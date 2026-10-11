@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.5.1 LANGUAGES CXX
+project(dngconv VERSION 0.6.0 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -17,14 +17,19 @@ option(DNGCONV_BUILD_TESTS "Build the test suite" ON)
 # An explicit -DLIBRAW_INCLUDE_DIR=... -DLIBRAW_LIBRARY=... always wins (handy
 # for a self-built LibRaw). Otherwise three ways to find it, in order: a CMake
 # package (vcpkg), pkg-config (Linux, Homebrew), a plain header/library
-# search. The thread-safe build (raw_r) is preferred when present.
+# search. The thread-safe build (raw_r) is preferred when present; with the
+# other one, decoding is done one file at a time.
 add_library(dngconv_libraw INTERFACE)
 set(_libraw_found FALSE)
+set(_libraw_reentrant FALSE)
 
 if(LIBRAW_INCLUDE_DIR AND LIBRAW_LIBRARY)
   target_include_directories(dngconv_libraw INTERFACE ${LIBRAW_INCLUDE_DIR})
   target_link_libraries(dngconv_libraw INTERFACE ${LIBRAW_LIBRARY})
   set(_libraw_found TRUE)
+  if("${LIBRAW_LIBRARY}" MATCHES "raw_r")
+    set(_libraw_reentrant TRUE)
+  endif()
 endif()
 
 if(NOT _libraw_found)
@@ -32,6 +37,7 @@ if(NOT _libraw_found)
   if(TARGET libraw::raw_r)
     target_link_libraries(dngconv_libraw INTERFACE libraw::raw_r)
     set(_libraw_found TRUE)
+    set(_libraw_reentrant TRUE)
   elseif(TARGET libraw::raw)
     target_link_libraries(dngconv_libraw INTERFACE libraw::raw)
     set(_libraw_found TRUE)
@@ -42,7 +48,9 @@ if(NOT _libraw_found)
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(LIBRAW_PC QUIET IMPORTED_TARGET libraw_r>=0.21)
-    if(NOT LIBRAW_PC_FOUND)
+    if(LIBRAW_PC_FOUND)
+      set(_libraw_reentrant TRUE)
+    else()
       pkg_check_modules(LIBRAW_PC QUIET IMPORTED_TARGET libraw>=0.21)
     endif()
     if(LIBRAW_PC_FOUND)
@@ -59,7 +67,17 @@ if(NOT _libraw_found)
     target_include_directories(dngconv_libraw INTERFACE ${LIBRAW_INCLUDE_DIR})
     target_link_libraries(dngconv_libraw INTERFACE ${LIBRAW_LIBRARY})
     set(_libraw_found TRUE)
+    if("${LIBRAW_LIBRARY}" MATCHES "raw_r")
+      set(_libraw_reentrant TRUE)
+    endif()
   endif()
+endif()
+
+if(_libraw_reentrant)
+  target_compile_definitions(dngconv_libraw INTERFACE DNGCONV_LIBRAW_REENTRANT=1)
+  message(STATUS "LibRaw: thread-safe build (raw_r); files are decoded in parallel")
+elseif(_libraw_found)
+  message(STATUS "LibRaw: not the thread-safe build; files are decoded one at a time")
 endif()
 
 if(NOT _libraw_found)
@@ -99,6 +117,7 @@ add_library(dngconv_core STATIC
   src/md5.cpp
   src/original_raw.cpp
   src/raw_reader.cpp
+  src/sidecar.cpp
   src/source_metadata.cpp
   src/thumbnail.cpp
   src/tiff_source.cpp
@@ -150,6 +169,15 @@ if(DNGCONV_BUILD_TESTS)
   add_executable(test_check tests/test_check.cpp)
   target_link_libraries(test_check PRIVATE dngconv_core dngconv_warnings)
   add_test(NAME check COMMAND test_check ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(test_batch tests/test_batch.cpp)
+  target_link_libraries(test_batch PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME batch COMMAND test_batch ${CMAKE_CURRENT_BINARY_DIR})
+
+  # Runs the program itself.
+  add_executable(test_cli tests/test_cli.cpp)
+  target_link_libraries(test_cli PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME cli COMMAND test_cli $<TARGET_FILE:dngconv> ${CMAKE_CURRENT_BINARY_DIR})
 
   add_executable(test_roundtrip tests/test_roundtrip.cpp)
   target_link_libraries(test_roundtrip PRIVATE dngconv_core dngconv_warnings)

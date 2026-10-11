@@ -20,6 +20,8 @@ struct RawReadOptions {
     /// Look for the camera's lens-correction parameters (distortion,
     /// chromatic aberration, vignetting).
     bool readLensData = true;
+    /// Pick up an XMP sidecar file lying next to the source file.
+    bool readSidecar = true;
     /// Keep a copy of the whole source file in RawImage::originalFile, for
     /// embedding in the DNG.
     bool keepOriginalFile = false;

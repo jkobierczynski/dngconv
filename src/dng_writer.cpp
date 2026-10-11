@@ -81,6 +81,7 @@ constexpr uint16_t DNGPrivateData = 50740;
 constexpr uint16_t RawDataUniqueID = 50781;
 constexpr uint16_t ActiveArea = 50829;
 constexpr uint16_t OpcodeList1 = 51008;
+constexpr uint16_t XMP = 700;
 constexpr uint16_t OpcodeList3 = 51022;
 constexpr uint16_t NewRawImageDigest = 51111;
 // EXIF IFD
@@ -573,6 +574,9 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (!img.description.empty()) ifd0.setAscii(tag::ImageDescription, img.description);
     // Copyright, XMP and anything descriptive the decoder did not report.
     copyFields(img.source.ifd0, ifd0, false);
+    // A sidecar is newer than anything inside the camera file: it wins.
+    if (options.xmpSidecar && !img.xmpSidecar.empty())
+        ifd0.setRaw(tag::XMP, 1, static_cast<uint32_t>(img.xmpSidecar.size()), img.xmpSidecar);
     if (!img.bodySerial.empty()) ifd0.setAscii(tag::CameraSerialNumber, img.bodySerial);
     if (!img.originalFileName.empty())
         ifd0.setAscii(tag::OriginalRawFileName, img.originalFileName);

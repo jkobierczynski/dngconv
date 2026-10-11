@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.5.1.
+Last updated: 2026-10-11, at version 0.6.0.
 
 ## Status at a glance
 
@@ -22,6 +22,7 @@ Last updated: 2026-10-11, at version 0.5.1.
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
 | Checking existing DNGs (`check`) | Working; agrees with Adobe's validator on sound and damaged files, also for DNGs written by Adobe's SDK and by cameras |
+| Batch work (`--update`, `--keep-times`, several files at once, XMP sidecars) | Working; clean under the thread sanitizer |
 | Lens corrections as opcodes | Sony, Fujifilm, Panasonic, Olympus; distortion checked against each camera's own JPEG on five files |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
@@ -304,6 +305,33 @@ How the decoder and the digests were verified beyond the unit tests:
 - **Damage**: on 36 files with one flipped bit `check` and Adobe's validator
   gave the same verdict 36 times.
 
+### 0.6.0 (2026-10-11): batch conveniences
+
+1. **Several files at once** (`job_runner.hpp`): a small pool that runs the
+   per-file work on a few threads and hands the reports back in the order of
+   the file list. Conversion, `extract` and `check` all go through it.
+   `-j` now means threads in total; `-p` the number of files at once.
+2. **`--update`**: skip what has a DNG that is not older than its source.
+3. **`--keep-times`**, for conversion and for `extract`.
+4. **XMP sidecars** (`sidecar`): found next to the raw file, stored as the
+   DNG's XMP tag.
+5. **Two new test programs**: `test_batch` (runner, sidecars, the XMP tag)
+   and `test_cli`, which runs the program itself on DNGs it generates.
+
+Findings, and what was done:
+
+| Finding | Resolution |
+|---|---|
+| LibRaw comes in two builds, and only `libraw_r` may decode two files at the same time; the other keeps state in static storage. Which one is linked is decided by the build system. | CMake records it (`DNGCONV_LIBRAW_REENTRANT`) and prints it. Without the thread-safe build, decoding takes turns behind a mutex; everything else still runs in parallel. Both variants were built and tested. |
+| The thread sanitizer reported two data races in the first parallel run. Both lie inside LibRaw's CR3 decoder, between a thread and the OpenMP workers that same decoder started: the usual false alarm with an OpenMP runtime the sanitizer cannot see into. There is only one CR3 file among the samples, so two conversions cannot have been involved. | Suppressed for the test (`race:libraw_r.so`). With that, conversion with `-e --verify`, `check`, `extract` and the unit tests run clean with eight threads on four files. |
+| Two inputs can map to one output: the same file name in two source folders sent to one flat folder, or `IMG.CR2` beside `IMG.NEF`. One at a time, the second was refused because the file existed; in parallel both would have written the same temporary file. | Targets are worked out before anything starts; the first claimant gets the name, the others an error. `extract` does a first pass that reads only the recorded names, for the same reason. |
+| `--update` compares times, and `--keep-times` sets the DNG's time to the source's. A sidecar edited after conversion would then never trigger a new conversion, or, compared naively, always. | "The source's time" is the later of raw file and sidecar, for the comparison and for the time that is kept. |
+| A sidecar need not be XMP just because it is called `.xmp`. | It must hold an `x:xmpmeta` or `rdf:RDF` element and be under 16 MiB; otherwise a warning, and the conversion goes on without it. |
+
+Measured on the 15 samples with two cores: 10.9 s one file at a time, 8.2 s
+with two at once. The output is byte-identical either way, and so is the
+report apart from the timings.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -403,6 +431,23 @@ form this program cannot decode, is "not verified": it is not damaged as far
 as anyone can tell, and it would be wrong to count it either way. The exit
 status follows damage only.
 
+**Reports in list order, whatever finishes first.** A run over a thousand
+files is read afterwards, compared with the previous run, or searched for
+the one failure. That only works if the output does not depend on timing,
+so each job's messages are held back until every job before it has
+reported.
+
+**Four files at once by default.** A file being converted is in memory in
+full, and people run this on laptops. The thread count is the number of
+cores; the number of files is capped, and `-p` lifts the cap.
+
+**`--update` goes by time, not by content.** Comparing content would mean
+decoding every source again, which is what the option is there to avoid.
+The cost is that it trusts file times.
+
+**`--keep-times` is opt-in.** A new file with an old date surprises backup
+and sync tools that go by time.
+
 **Never overwrite, write through a temporary file.** A converter people point
 at their only copy of a photo archive should fail safe.
 
@@ -416,7 +461,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (8 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, DNG round trips through LibRaw in both byte orders |
+| Unit tests (10 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -429,6 +474,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
 | Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
+| Threads | GCC 13 thread sanitizer | Parallel conversion, checking and extraction of all samples, and the unit tests, with LibRaw's own OpenMP threads excluded |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
 
 `dng_validate` is not part of this repository and is not needed to build or

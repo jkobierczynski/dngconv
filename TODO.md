@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.5.1.
+Last updated: 2026-10-11, at version 0.6.0.
 
 ## Needs someone with the software or an account
 
@@ -65,15 +65,15 @@ close the largest gaps in the verification.
       camera-written DNGs can be watched from then on.
 - [ ] Tile sizes that divide the frame evenly, so that no padding is needed
       at all (it is cheap since 0.5.1, not free).
-- [ ] Convert several files in parallel (today only the tiles of one file
-      are compressed in parallel).
-- [ ] Keep file timestamps, for DNGs and for extracted originals.
-- [ ] Pick up an XMP sidecar next to the source file.
 - [ ] Embed a camera's `.THM` sidecar with the original (forks 5 to 8 of
       `OriginalRawFileData` exist for that).
 - [ ] Stream the original instead of holding the file and its packed copy in
       memory.
 - [ ] A `--byte-order` switch.
+- [ ] `--update` by content (a checksum of the source stored in the DNG)
+      for archives whose file times cannot be trusted.
+- [ ] Choose the number of files converted at once from the memory that is
+      free, instead of the fixed four.
 - [ ] Detect an input that already is a DNG before decoding it.
 - [ ] Sigma X3F: document or automate building LibRaw with X3F support.
 

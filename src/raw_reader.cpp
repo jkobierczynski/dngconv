@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 
@@ -16,6 +17,7 @@
 
 #include "lens_data.hpp"
 #include "original_raw.hpp"
+#include "sidecar.hpp"
 #include "source_metadata.hpp"
 
 #if !LIBRAW_COMPILE_CHECK_VERSION_NOTLESS(0, 21)
@@ -201,6 +203,13 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
     RawReadResult result;
     RawImage& img = result.image;
     auto& warnings = result.warnings;
+
+#ifndef DNGCONV_LIBRAW_REENTRANT
+    // Only LibRaw's thread-safe build (libraw_r) may decode several files at
+    // once; with the other one, callers on different threads take turns.
+    static std::mutex decoderMutex;
+    const std::lock_guard<std::mutex> decoderLock(decoderMutex);
+#endif
 
     // LibRaw objects are large; keep them off the stack.
     auto lrOwner = std::make_unique<LibRaw>();
@@ -542,6 +551,17 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
     }
 
     if (options.keepOriginalFile && !options.metadataOnly) img.originalFile = readWholeFile(path);
+
+    if (options.readSidecar) {
+        const std::filesystem::path sidecar = findXmpSidecar(path);
+        if (!sidecar.empty()) {
+            img.xmpSidecar = readXmpSidecar(sidecar);
+            if (img.xmpSidecar.empty())
+                warnings.push_back("'" + sidecar.filename().u8string() + "' does not hold XMP metadata; ignored");
+            else
+                img.xmpSidecarName = sidecar.filename().u8string();
+        }
+    }
 
     // ---- embedded preview ---------------------------------------------------
     if (options.loadPreview && !options.metadataOnly) {

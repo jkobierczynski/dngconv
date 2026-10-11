@@ -52,6 +52,9 @@ struct DngWriteOptions {
     /// Which of the camera's lens corrections (RawImage::lens) to pass on to
     /// the reader as opcodes.
     LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
+    /// Store RawImage::xmpSidecar, when it is not empty, as the DNG's XMP
+    /// metadata, in place of any XMP the source file itself held.
+    bool xmpSidecar = true;
     DngByteOrder byteOrder = DngByteOrder::MatchSource;
     /// Value of the TIFF Software tag.
     std::string software = "dngconv";

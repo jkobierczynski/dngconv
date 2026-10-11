@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib.
 
-Status: **0.5.1, early**. It works on the cameras listed under
+Status: **0.6.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -39,6 +39,10 @@ Status: **0.5.1, early**. It works on the cameras listed under
 - `dngconv check` tells, years later, whether a DNG is still intact: it
   recomputes the checksums of the raw data and of the embedded original.
   It works on DNGs from other converters too.
+- Made for whole folders: several files are converted at once, `--update`
+  skips what is already done, `--keep-times` gives each DNG the date of its
+  source, and an XMP sidecar next to a raw file (ratings, keywords, edits)
+  is taken into the DNG.
 - Writes through a temporary file, so an interrupted run leaves no half DNG.
 
 ## Download
@@ -85,6 +89,7 @@ cmake -S . -B build -DLIBRAW_INCLUDE_DIR=/path/to/LibRaw \
 dngconv IMG_0036.CR3                  # writes IMG_0036.dng next to it
 dngconv -o out/ *.NEF                 # into a folder
 dngconv -r -o ~/dng ~/photos/2026     # a whole tree, keeping its structure
+dngconv -r -u -t -o ~/dng ~/photos    # the same again later: only what is new
 dngconv --verify -o safe.dng shot.ARW # convert, then prove nothing was lost
 dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
 dngconv --lens-corrections none *.ARW # leave the lens corrections out
@@ -102,11 +107,18 @@ dngconv -i shot.RAF                   # show what the decoder finds
                             pass the camera's lens corrections on to the
                             DNG reader: auto (default; those the camera was
                             set to apply), all, or none
+      --no-sidecar          do not take over an XMP sidecar file (IMG.xmp or
+                            IMG.CR3.xmp next to IMG.CR3)
   -r, --recursive           descend into sub-folders
   -f, --force               overwrite existing DNG files
+  -u, --update              skip files whose DNG exists and is not older than
+                            the source; convert the others
+  -t, --keep-times          give each DNG the modification time of its source
       --verify              re-read each DNG and compare it with the source
                             (pixels, and the embedded original if any)
-  -j, --jobs <n>            compression threads (default: all cores)
+  -j, --jobs <n>            threads in total (default: all cores)
+  -p, --parallel <n>        files converted at the same time (default: up to
+                            4, as far as the threads allow)
   -i, --info                show what the decoder finds; write nothing
   -q, --quiet               only report problems
   -V, --version             show version information
@@ -115,6 +127,46 @@ dngconv -i shot.RAF                   # show what the decoder finds
 Existing files are never overwritten without `--force`. The exit status is 0
 when everything converted, 1 when at least one file failed, 2 for a usage
 error.
+
+### Working through a folder
+
+**Only what is new.** Without `--update`, a DNG that already exists is an
+error for that file (`--force` overwrites). With `--update` (`-u`) a file is
+skipped when its DNG exists and is at least as new as the source, converted
+when there is no DNG yet, and converted again when the source has changed
+since:
+
+```
+$ dngconv -r -u -o ~/dng ~/photos
+3 converted, 4812 already up to date, 0 failed
+```
+
+**Dates.** A new DNG normally carries the time of its conversion.
+`--keep-times` (`-t`) gives it the modification time of the raw file instead,
+which keeps a folder sorted by date in order. `dngconv extract -t` does the
+same for a restored original, using the DNG's time.
+
+**Sidecars.** Programs that must not change a raw file keep ratings,
+keywords and edits in an XMP file next to it. dngconv looks for `IMG_0001.xmp`
+(Adobe's programs and most others) and then `IMG_0001.CR3.xmp` (darktable)
+next to `IMG_0001.CR3`, and stores what it finds as the DNG's XMP metadata,
+which is where a DNG keeps such things. A sidecar takes precedence over XMP
+inside the camera file. With a sidecar, "the time of the source" above means
+the later of the two times, so a rating changed after conversion makes
+`--update` convert the file again. `--no-sidecar` switches all of this off.
+
+**Several files at once.** With more than one file to do, up to four are
+worked on at the same time, each using its share of the threads; the lines
+of the report still come in the order of the files. `-j` sets the number of
+threads in total, `-p` the number of files at once. Every file being
+converted is held in memory in full (some hundred megabytes for a large
+sensor, twice that with `-e`), which is why the default stops at four.
+`check` and `extract` take the same two options.
+
+Two sources that would produce the same DNG (`a/IMG.CR3` and `b/IMG.CR3`
+sent to one folder, or `IMG.CR2` next to `IMG.NEF`) are not left to
+overwrite each other: the first is converted, the second refused with a
+message.
 
 ### Keeping and restoring the original
 
@@ -133,6 +185,10 @@ dngconv -i shot.dng                   # says whether an original is inside
   -o, --output <path>       output file (one input) or output folder
   -r, --recursive           descend into sub-folders
   -f, --force               overwrite existing files
+  -t, --keep-times          give each restored file the modification time of
+                            its DNG
+  -j, --jobs <n>            threads in total (default: all cores)
+  -p, --parallel <n>        files worked on at the same time (default: up to 4)
   -q, --quiet               only report problems
 ```
 
@@ -166,7 +222,8 @@ dngconv check -q -r ~/dng             # only say what is not intact
 
 ```
   -r, --recursive           descend into sub-folders
-  -j, --jobs <n>            threads (default: all cores)
+  -j, --jobs <n>            threads in total (default: all cores)
+  -p, --parallel <n>        files checked at the same time (default: up to 4)
   -q, --quiet               only report files that are not intact
 ```
 
@@ -530,8 +587,10 @@ EOS R8 file, for example, gets an active area of 5999 x 3999 from 0.21.2 and
 | `src/dng_check.*` | Reads a DNG's raw data as stored and compares the file with its checksums |
 | `src/parallel.hpp` | Runs a job list on all cores |
 | `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset |
+| `src/sidecar.*` | Finds and reads XMP sidecar files |
+| `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), the job runner and sidecars, the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

@@ -167,6 +167,11 @@ struct RawImage {
     // A complete JPEG stream taken unchanged from the source file, or empty.
     std::vector<uint8_t> previewJpeg;
 
+    // The XMP sidecar found next to the source file (ratings, keywords,
+    // edits), to be stored in the DNG's XMP tag; empty if there is none.
+    std::vector<uint8_t> xmpSidecar;
+    std::string xmpSidecarName;
+
     size_t sampleCount() const {
         return static_cast<size_t>(width) * height * samplesPerPixel;
     }

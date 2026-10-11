@@ -5,14 +5,17 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -24,8 +27,10 @@
 
 #include "dng_check.hpp"
 #include "dng_writer.hpp"
+#include "job_runner.hpp"
 #include "original_raw.hpp"
 #include "raw_reader.hpp"
+#include "sidecar.hpp"
 #include "version.hpp"
 
 namespace fs = std::filesystem;
@@ -41,12 +46,16 @@ struct Settings {
     bool makerNotes = true;
     bool embedOriginal = false;
     LensCorrectionMode lensCorrections = LensCorrectionMode::Auto;
+    bool sidecar = true;
     bool recursive = false;
     bool force = false;
+    bool update = false;
+    bool keepTimes = false;
     bool verify = false;
     bool info = false;
     bool quiet = false;
-    unsigned threads = 0;
+    unsigned threads = 0;   // all threads together; 0 = one per core
+    unsigned parallel = 0;  // files worked on at once; 0 = decide from the above
 };
 
 struct Job {
@@ -77,11 +86,18 @@ const char* const kUsage =
     "                            pass the camera's lens corrections on to the\n"
     "                            DNG reader: auto (default; those the camera was\n"
     "                            set to apply), all, or none\n"
+    "      --no-sidecar          do not take over an XMP sidecar file (IMG.xmp or\n"
+    "                            IMG.CR3.xmp next to IMG.CR3)\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -f, --force               overwrite existing DNG files\n"
+    "  -u, --update              skip files whose DNG exists and is not older than\n"
+    "                            the source; convert the others\n"
+    "  -t, --keep-times          give each DNG the modification time of its source\n"
     "      --verify              re-read each DNG and compare it with the source\n"
     "                            (pixels, and the embedded original if any)\n"
-    "  -j, --jobs <n>            compression threads (default: all cores)\n"
+    "  -j, --jobs <n>            threads in total (default: all cores)\n"
+    "  -p, --parallel <n>        files converted at the same time (default: up to\n"
+    "                            4, as far as the threads allow)\n"
     "  -i, --info                show what the decoder finds; write nothing\n"
     "  -q, --quiet               only report problems\n"
     "  -V, --version             show version information\n"
@@ -99,6 +115,10 @@ const char* const kExtractUsage =
     "                            (default: next to each DNG)\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -f, --force               overwrite existing files\n"
+    "  -t, --keep-times          give each restored file the modification time of\n"
+    "                            its DNG\n"
+    "  -j, --jobs <n>            threads in total (default: all cores)\n"
+    "  -p, --parallel <n>        files worked on at the same time (default: up to 4)\n"
     "  -q, --quiet               only report problems\n"
     "  -h, --help                show this help\n";
 
@@ -112,7 +132,8 @@ const char* const kCheckUsage =
     "\n"
     "Options:\n"
     "  -r, --recursive           descend into sub-folders\n"
-    "  -j, --jobs <n>            threads (default: all cores)\n"
+    "  -j, --jobs <n>            threads in total (default: all cores)\n"
+    "  -p, --parallel <n>        files checked at the same time (default: up to 4)\n"
     "  -q, --quiet               only report files that are not intact\n"
     "  -h, --help                show this help\n"
     "\n"
@@ -143,6 +164,64 @@ std::string megabytes(std::uintmax_t bytes) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
     return buf;
+}
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+std::string format(const char* fmt, ...) {
+    char buffer[2048];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buffer, sizeof buffer, fmt, args);
+    va_end(args);
+    return buffer;
+}
+
+// Reads a count given as an option value. Returns false, with a message, if
+// it is not a number in 1..1024.
+bool parseCount(const std::vector<std::string>& args, size_t& i, const char* command, unsigned& out) {
+    char* end = nullptr;
+    const long n = i + 1 < args.size() ? std::strtol(args[i + 1].c_str(), &end, 10) : 0;
+    if (i + 1 >= args.size() || !end || *end || n < 1 || n > 1024) {
+        std::fprintf(stderr, "%s: option %s needs a number from 1 to 1024\n", command, args[i].c_str());
+        return false;
+    }
+    out = static_cast<unsigned>(n);
+    ++i;
+    return true;
+}
+
+// How the threads are spent: on how many files at once, and how many each
+// file gets for its own work (compressing tiles, hashing).
+struct ThreadPlan {
+    unsigned files = 1;
+    unsigned perFile = 1;
+};
+
+ThreadPlan planThreads(const Settings& s, size_t jobs) {
+    unsigned total = s.threads ? s.threads : std::thread::hardware_concurrency();
+    if (total == 0) total = 1;
+    ThreadPlan plan;
+    // Every file being worked on is held in memory in full, so the default
+    // stops at four; -p lifts that.
+    plan.files = s.parallel ? s.parallel : std::min(total, 4u);
+    plan.files = static_cast<unsigned>(std::min<size_t>(plan.files, std::max<size_t>(jobs, 1)));
+    plan.perFile = std::max(1u, total / plan.files);
+    return plan;
+}
+
+// Hands a job's messages to the terminal: warnings and errors first, as
+// they were printed before the line that says what was done.
+void emitReport(const JobReport& report) {
+    if (!report.err.empty()) {
+        std::fputs(report.err.c_str(), stderr);
+        std::fflush(stderr);
+    }
+    if (!report.out.empty()) {
+        std::fputs(report.out.c_str(), stdout);
+        std::fflush(stdout);
+    }
 }
 
 std::vector<std::string> commandLine(int argc, char** argv) {
@@ -203,15 +282,15 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
                 return false;
             }
         } else if (a == "-j" || a == "--jobs") {
-            const std::string* v = needValue(i, a);
-            if (!v) return false;
-            char* end = nullptr;
-            const long n = std::strtol(v->c_str(), &end, 10);
-            if (!end || *end || n < 1 || n > 1024) {
-                std::fprintf(stderr, "dngconv: invalid thread count '%s'\n", v->c_str());
-                return false;
-            }
-            s.threads = static_cast<unsigned>(n);
+            if (!parseCount(args, i, "dngconv", s.threads)) return false;
+        } else if (a == "-p" || a == "--parallel") {
+            if (!parseCount(args, i, "dngconv", s.parallel)) return false;
+        } else if (a == "--no-sidecar") {
+            s.sidecar = false;
+        } else if (a == "-u" || a == "--update") {
+            s.update = true;
+        } else if (a == "-t" || a == "--keep-times") {
+            s.keepTimes = true;
         } else if (a == "--no-preview") {
             s.preview = false;
         } else if (a == "--no-maker-notes") {
@@ -395,6 +474,8 @@ void printInfo(const fs::path& path, const RawReadResult& r, LensCorrectionMode 
             std::printf("  corrections   none would be written\n");
         for (const auto& note : opcodes.notes) std::printf("  note          %s\n", note.c_str());
     }
+    if (!img.xmpSidecarName.empty())
+        std::printf("  sidecar       %s (%zu bytes of XMP)\n", img.xmpSidecarName.c_str(), img.xmpSidecar.size());
     if (r.sourceIsDng) {
         std::printf("  note          this file already is a DNG\n");
         try {
@@ -415,6 +496,8 @@ void verifyOutput(const RawImage& source, const fs::path& dng) {
     RawReadOptions ro;
     ro.loadPreview = false;
     ro.copyMetadata = false;
+    ro.readLensData = false;
+    ro.readSidecar = false;
     const RawReadResult back = readRaw(dng, ro);
     const RawImage& b = back.image;
     if (b.width != source.width || b.height != source.height ||
@@ -496,6 +579,12 @@ bool parseExtractArguments(const std::vector<std::string>& args, Settings& s, in
             s.recursive = true;
         } else if (a == "-f" || a == "--force") {
             s.force = true;
+        } else if (a == "-t" || a == "--keep-times") {
+            s.keepTimes = true;
+        } else if (a == "-j" || a == "--jobs") {
+            if (!parseCount(args, i, "dngconv extract", s.threads)) return false;
+        } else if (a == "-p" || a == "--parallel") {
+            if (!parseCount(args, i, "dngconv extract", s.parallel)) return false;
         } else if (a == "-q" || a == "--quiet") {
             s.quiet = true;
         } else {
@@ -527,37 +616,67 @@ int runExtract(const std::vector<std::string>& args) {
     const bool outputIsFile = outputIsSingleFile(settings, jobs, anyFolder);
     const fs::path outputRoot = settings.output.empty() ? fs::path() : fs::u8path(settings.output);
 
-    int extracted = 0, skipped = 0, failed = allFound ? 0 : 1;
-    for (const Job& job : jobs) {
+    // A first pass over the DNGs, reading only the names: it settles where
+    // each original goes before any is written, so that two DNGs holding a
+    // file of the same name cannot race for it.
+    enum class Outcome { Extracted, NoOriginal, Failed };
+    std::vector<Outcome> outcomes(jobs.size(), Outcome::Failed);
+    std::vector<fs::path> targets(jobs.size());
+    std::vector<std::string> early(jobs.size());  // a failure found in this pass
+    std::vector<char> absent(jobs.size(), 0);
+    {
+        std::map<std::string, size_t> taken;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            const Job& job = jobs[i];
+            try {
+                const EmbeddedOriginal original = readEmbeddedOriginal(job.input, false);
+                if (!original.present) {
+                    absent[i] = 1;
+                    continue;
+                }
+                if (outputIsFile) {
+                    targets[i] = outputRoot;
+                } else {
+                    // Without a recorded name, fall back to the DNG's own.
+                    const fs::path fileName = original.fileName.empty()
+                                                  ? fs::path(job.input.stem()) += ".original"
+                                                  : fs::u8path(original.fileName);
+                    const fs::path folder = outputRoot.empty() ? job.input.parent_path()
+                                                               : outputRoot / job.relative.parent_path();
+                    targets[i] = folder / fileName;
+                }
+                const auto [first, fresh] = taken.emplace(targets[i].lexically_normal().u8string(), i);
+                if (!fresh)
+                    early[i] = "holds '" + show(targets[i].filename()) + "', as does '" +
+                               show(jobs[first->second].input) + "'; extract them into separate folders";
+            } catch (const std::exception& e) {
+                early[i] = e.what();
+            }
+        }
+    }
+
+    const ThreadPlan plan = planThreads(settings, jobs.size());
+    const auto extractOne = [&](size_t index, JobReport& report) {
+        const Job& job = jobs[index];
         const std::string name = show(job.input);
         try {
-            const EmbeddedOriginal original = readEmbeddedOriginal(job.input);
-            if (!original.present) {
+            if (!early[index].empty()) throw std::runtime_error(early[index]);
+            if (absent[index]) {
                 // In a folder, DNGs without an original are expected; a file
                 // asked for by name that has none is a failed request.
                 if (job.named) throw std::runtime_error("holds no embedded original");
-                ++skipped;
-                continue;
+                outcomes[index] = Outcome::NoOriginal;
+                return;
             }
+            const EmbeddedOriginal original = readEmbeddedOriginal(job.input);
+            if (!original.present) throw std::runtime_error("holds no embedded original");
             if (original.hasDigest && !original.digestMatches)
                 throw std::runtime_error("the embedded original is damaged (checksum mismatch); "
                                          "nothing was written");
             const std::vector<uint8_t> bytes =
                 unpackOriginalRaw(original.packed.data(), original.packed.size());
 
-            fs::path target;
-            if (outputIsFile) {
-                target = outputRoot;
-            } else {
-                // Without a recorded name, fall back to the DNG's own.
-                const fs::path fileName = original.fileName.empty()
-                                              ? fs::path(job.input.stem()) += ".original"
-                                              : fs::u8path(original.fileName);
-                const fs::path folder = outputRoot.empty() ? job.input.parent_path()
-                                                           : outputRoot / job.relative.parent_path();
-                target = folder / fileName;
-            }
-
+            const fs::path& target = targets[index];
             std::error_code ec;
             if (fs::exists(target, ec)) {
                 if (fs::equivalent(target, job.input, ec))
@@ -573,17 +692,30 @@ int runExtract(const std::vector<std::string>& args) {
                                              show(target.parent_path()) + "': " + ec.message());
             }
             writeFileSafely(target, bytes);
-            if (!settings.quiet) {
-                std::printf("%s -> %s  (%s%s)\n", name.c_str(), show(target).c_str(),
-                            megabytes(bytes.size()).c_str(),
-                            original.hasDigest ? ", checksum verified" : ", no checksum in file");
-                std::fflush(stdout);
+            if (settings.keepTimes) {
+                const fs::file_time_type time = fs::last_write_time(job.input, ec);
+                if (!ec) fs::last_write_time(target, time, ec);
+                if (ec)
+                    report.err += format("dngconv: %s: warning: could not set the time of '%s': %s\n",
+                                         name.c_str(), show(target).c_str(), ec.message().c_str());
             }
-            ++extracted;
+            if (!settings.quiet)
+                report.out = format("%s -> %s  (%s%s)\n", name.c_str(), show(target).c_str(),
+                                    megabytes(bytes.size()).c_str(),
+                                    original.hasDigest ? ", checksum verified" : ", no checksum in file");
+            outcomes[index] = Outcome::Extracted;
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "dngconv: %s: %s\n", name.c_str(), e.what());
-            ++failed;
+            report.err += format("dngconv: %s: %s\n", name.c_str(), e.what());
+            outcomes[index] = Outcome::Failed;
         }
+    };
+    runJobs(jobs.size(), plan.files, extractOne, [](size_t, const JobReport& report) { emitReport(report); });
+
+    int extracted = 0, skipped = 0, failed = allFound ? 0 : 1;
+    for (Outcome o : outcomes) {
+        if (o == Outcome::Extracted) ++extracted;
+        if (o == Outcome::NoOriginal) ++skipped;
+        if (o == Outcome::Failed) ++failed;
     }
 
     if (!settings.quiet && jobs.size() > 1) {
@@ -611,14 +743,9 @@ bool parseCheckArguments(const std::vector<std::string>& args, Settings& s, int&
             exitCode = 0;
             return false;
         } else if (a == "-j" || a == "--jobs") {
-            char* end = nullptr;
-            const long n = i + 1 < args.size() ? std::strtol(args[i + 1].c_str(), &end, 10) : 0;
-            if (i + 1 >= args.size() || !end || *end || n < 1 || n > 1024) {
-                std::fprintf(stderr, "dngconv check: option %s needs a thread count\n", a.c_str());
-                return false;
-            }
-            s.threads = static_cast<unsigned>(n);
-            ++i;
+            if (!parseCount(args, i, "dngconv check", s.threads)) return false;
+        } else if (a == "-p" || a == "--parallel") {
+            if (!parseCount(args, i, "dngconv check", s.parallel)) return false;
         } else if (a == "-r" || a == "--recursive") {
             s.recursive = true;
         } else if (a == "-q" || a == "--quiet") {
@@ -651,11 +778,14 @@ int runCheck(const std::vector<std::string>& args) {
     }
 
     using State = DngCheck::State;
-    int intact = 0, damaged = 0, unverified = 0, failed = allFound ? 0 : 1;
-    for (const Job& job : jobs) {
-        const std::string name = show(job.input);
+    enum class Outcome { Intact, Damaged, Unverified, Failed };
+    std::vector<Outcome> outcomes(jobs.size(), Outcome::Failed);
+    const ThreadPlan plan = planThreads(settings, jobs.size());
+
+    const auto checkOne = [&](size_t index, JobReport& report) {
+        const std::string name = show(jobs[index].input);
         try {
-            const DngCheck c = checkDng(job.input, settings.threads);
+            const DngCheck c = checkDng(jobs[index].input, plan.perFile);
             if (c.damaged()) {
                 // A file that is cut short usually has more than one thing
                 // wrong with it; the cause is the useful message.
@@ -664,27 +794,35 @@ int runCheck(const std::vector<std::string>& args) {
                 if (!c.truncated && c.original == State::Damaged)
                     what += (what.empty() ? "" : "; ") + c.originalDetail;
                 // On stdout like the other verdicts, so that one stream holds the whole report.
-                std::printf("%s: DAMAGED: %s\n", name.c_str(), what.c_str());
-                ++damaged;
+                report.out = format("%s: DAMAGED: %s\n", name.c_str(), what.c_str());
+                outcomes[index] = Outcome::Damaged;
             } else if (c.intact()) {
                 if (!settings.quiet)
-                    std::printf("%s: intact (raw image%s)\n", name.c_str(),
-                                c.original == State::Intact ? ", embedded original" : "");
-                ++intact;
+                    report.out = format("%s: intact (raw image%s)\n", name.c_str(),
+                                        c.original == State::Intact ? ", embedded original" : "");
+                outcomes[index] = Outcome::Intact;
             } else {
-                std::string what;
-                if (c.rawImage == State::Intact) what = "raw image intact";
-                else what = c.rawDetail;
-                if (c.original == State::Intact) what += "; embedded original intact";
-                else if (c.original == State::Unverified) what += "; embedded original " + c.originalDetail;
-                std::printf("%s: not verified: %s\n", name.c_str(), what.c_str());
-                ++unverified;
+                std::string what = c.rawImage == State::Intact ? "raw image intact" : c.rawDetail;
+                if (c.original == State::Intact)
+                    what += "; embedded original intact";
+                else if (c.original == State::Unverified)
+                    what += "; embedded original " + c.originalDetail;
+                report.out = format("%s: not verified: %s\n", name.c_str(), what.c_str());
+                outcomes[index] = Outcome::Unverified;
             }
-            std::fflush(stdout);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "dngconv: %s: %s\n", name.c_str(), e.what());
-            ++failed;
+            report.err = format("dngconv: %s: %s\n", name.c_str(), e.what());
+            outcomes[index] = Outcome::Failed;
         }
+    };
+    runJobs(jobs.size(), plan.files, checkOne, [](size_t, const JobReport& report) { emitReport(report); });
+
+    int intact = 0, damaged = 0, unverified = 0, failed = allFound ? 0 : 1;
+    for (Outcome o : outcomes) {
+        if (o == Outcome::Intact) ++intact;
+        if (o == Outcome::Damaged) ++damaged;
+        if (o == Outcome::Unverified) ++unverified;
+        if (o == Outcome::Failed) ++failed;
     }
 
     if (!settings.quiet && jobs.size() > 1) {
@@ -741,42 +879,84 @@ int main(int argc, char** argv) {
     const fs::path outputRoot = settings.output.empty() ? fs::path() : fs::u8path(settings.output);
     const bool outputIsFile = outputIsSingleFile(settings, jobs, anyFolder);
 
-    DngWriteOptions writeOptions;
-    writeOptions.compression = settings.compression;
-    writeOptions.threads = settings.threads;
-    writeOptions.embedPreview = settings.preview;
-    writeOptions.makerNotes = settings.makerNotes;
-    writeOptions.lensCorrections = settings.lensCorrections;
-    writeOptions.software = std::string("dngconv ") + kVersion;
-
-    int converted = 0, failed = allFound ? 0 : 1;
-    for (const Job& job : jobs) {
-        const std::string name = show(job.input);
-        try {
-            fs::path target;
+    // Where each file goes. Two sources that would land on the same DNG
+    // (same name in different folders, or IMG.CR2 next to IMG.NEF) must not
+    // race each other: the first keeps the name, the other is refused.
+    std::vector<fs::path> targets(jobs.size());
+    std::vector<std::string> clash(jobs.size());
+    {
+        std::map<std::string, size_t> taken;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            fs::path& target = targets[i];
             if (outputIsFile) {
                 target = outputRoot;
             } else if (!outputRoot.empty()) {
-                target = outputRoot / job.relative;
+                target = outputRoot / jobs[i].relative;
                 target.replace_extension(".dng");
             } else {
-                target = job.input;
+                target = jobs[i].input;
                 target.replace_extension(".dng");
             }
+            const auto [first, fresh] = taken.emplace(target.lexically_normal().u8string(), i);
+            if (!fresh) clash[i] = show(jobs[first->second].input);
+        }
+    }
 
+    const ThreadPlan plan = planThreads(settings, jobs.size());
+    DngWriteOptions writeOptions;
+    writeOptions.compression = settings.compression;
+    writeOptions.threads = plan.perFile;
+    writeOptions.embedPreview = settings.preview;
+    writeOptions.makerNotes = settings.makerNotes;
+    writeOptions.lensCorrections = settings.lensCorrections;
+    writeOptions.xmpSidecar = settings.sidecar;
+    writeOptions.software = std::string("dngconv ") + kVersion;
+
+    enum class Outcome { Converted, UpToDate, Failed };
+    std::vector<Outcome> outcomes(jobs.size(), Outcome::Failed);
+
+    const auto convertOne = [&](size_t index, JobReport& report) {
+        const Job& job = jobs[index];
+        const fs::path& target = targets[index];
+        const std::string name = show(job.input);
+        try {
+            if (!clash[index].empty())
+                throw std::runtime_error("would be written to '" + show(target) + "', like '" +
+                                         clash[index] + "'; give them separate output folders");
+
+            // The time the DNG has to keep up with: the source's, or its
+            // sidecar's if that was edited later.
             std::error_code ec;
+            fs::file_time_type sourceTime = fs::last_write_time(job.input, ec);
+            const bool haveSourceTime = !ec;
+            if (settings.sidecar) {
+                const fs::path sidecar = findXmpSidecar(job.input);
+                const fs::file_time_type sidecarTime =
+                    sidecar.empty() ? fs::file_time_type::min() : fs::last_write_time(sidecar, ec);
+                if (!sidecar.empty() && !ec && haveSourceTime) sourceTime = std::max(sourceTime, sidecarTime);
+            }
+
             if (fs::exists(target, ec)) {
                 if (fs::equivalent(target, job.input, ec))
                     throw std::runtime_error("output would overwrite the source file");
-                if (!settings.force)
+                if (settings.update && !settings.force) {
+                    const fs::file_time_type targetTime = fs::last_write_time(target, ec);
+                    if (!ec && haveSourceTime && targetTime >= sourceTime) {
+                        outcomes[index] = Outcome::UpToDate;
+                        return;
+                    }
+                } else if (!settings.force) {
                     throw std::runtime_error("'" + show(target) +
-                                             "' already exists (use --force to overwrite)");
+                                             "' already exists (use --force to overwrite, or "
+                                             "--update to skip what is done)");
+                }
             }
 
             const auto started = std::chrono::steady_clock::now();
             RawReadOptions ro;
             ro.loadPreview = settings.preview;
             ro.keepOriginalFile = settings.embedOriginal;
+            ro.readSidecar = settings.sidecar;
             RawReadResult source = readRaw(job.input, ro);
             if (source.sourceIsDng) throw std::runtime_error("already a DNG; skipped");
 
@@ -790,32 +970,49 @@ int main(int argc, char** argv) {
             if (settings.verify) verifyOutput(source.image, target);
             const LensOpcodes lens = makeLensOpcodes(source.image, settings.lensCorrections);
             for (const auto& note : lens.notes) source.warnings.push_back(note);
+            if (settings.keepTimes && haveSourceTime) {
+                fs::last_write_time(target, sourceTime, ec);
+                if (ec) source.warnings.push_back("could not set the time of '" + show(target) + "': " + ec.message());
+            }
 
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             for (const auto& w : source.warnings)
-                std::fprintf(stderr, "dngconv: %s: warning: %s\n", name.c_str(), w.c_str());
+                report.err += format("dngconv: %s: warning: %s\n", name.c_str(), w.c_str());
             if (!settings.quiet) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
-                std::printf("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s)\n", name.c_str(),
-                            show(target).c_str(), source.image.uniqueCameraModel.c_str(),
-                            megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
-                            lens.any() ? ", lens: " : "", lens.summary().c_str(),
-                            settings.verify ? (settings.embedOriginal
-                                                   ? ", pixels and embedded original verified"
-                                                   : ", verified")
-                                            : "");
-                std::fflush(stdout);
+                const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
+                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s)\n", name.c_str(),
+                                    show(target).c_str(), source.image.uniqueCameraModel.c_str(),
+                                    megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
+                                    lens.any() ? ", lens: " : "", lens.summary().c_str(),
+                                    sidecar ? ", with " : "",
+                                    sidecar ? source.image.xmpSidecarName.c_str() : "",
+                                    settings.verify ? (settings.embedOriginal
+                                                           ? ", pixels and embedded original verified"
+                                                           : ", verified")
+                                                    : "");
             }
-            ++converted;
+            outcomes[index] = Outcome::Converted;
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "dngconv: %s: %s\n", name.c_str(), e.what());
-            ++failed;
+            report.err += format("dngconv: %s: %s\n", name.c_str(), e.what());
+            outcomes[index] = Outcome::Failed;
         }
-    }
+    };
 
-    if (!settings.quiet && jobs.size() > 1)
-        std::printf("%d converted, %d failed\n", converted, failed);
+    runJobs(jobs.size(), plan.files, convertOne, [](size_t, const JobReport& report) { emitReport(report); });
+
+    int converted = 0, upToDate = 0, failed = allFound ? 0 : 1;
+    for (Outcome o : outcomes) {
+        if (o == Outcome::Converted) ++converted;
+        if (o == Outcome::UpToDate) ++upToDate;
+        if (o == Outcome::Failed) ++failed;
+    }
+    if (!settings.quiet && (jobs.size() > 1 || upToDate)) {
+        std::printf("%d converted", converted);
+        if (settings.update) std::printf(", %d already up to date", upToDate);
+        std::printf(", %d failed\n", failed);
+    }
     return failed ? 1 : 0;
 }
