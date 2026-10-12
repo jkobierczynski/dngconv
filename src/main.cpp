@@ -33,6 +33,7 @@
 #include "original_raw.hpp"
 #include "raw_reader.hpp"
 #include "sidecar.hpp"
+#include "source_record.hpp"
 #include "version.hpp"
 
 namespace fs = std::filesystem;
@@ -56,6 +57,9 @@ struct Settings {
     bool recursive = false;
     bool force = false;
     bool update = false;
+    bool updateByContent = false;  // decide by the source's checksum instead of file times
+    bool sourceRecord = true;      // note the source's checksum in each DNG
+    bool addChecksums = false;     // check command: write the checksums a file lacks
     bool keepTimes = false;
     bool verify = false;
     bool info = false;
@@ -112,6 +116,11 @@ const char* const kUsage =
     "  -f, --force               overwrite existing DNG files\n"
     "  -u, --update              skip files whose DNG exists and is not older than\n"
     "                            the source; convert the others\n"
+    "      --update-by <what>    how --update decides (and turns it on): time\n"
+    "                            (default), or content: the source file and its\n"
+    "                            sidecar are compared with the checksums noted in\n"
+    "                            the DNG when it was made, whatever the file times\n"
+    "      --no-source-record    do not note the source file's checksum in the DNG\n"
     "  -t, --keep-times          give each DNG the modification time of its source\n"
     "      --verify              re-read each DNG and compare it with the source\n"
     "                            (pixels, and the embedded original if any)\n"
@@ -151,6 +160,13 @@ const char* const kCheckUsage =
     "from any converter; files without checksums are reported as not verified.\n"
     "\n"
     "Options:\n"
+    "  -a, --add                 write the checksums into files that have none\n"
+    "                            (most DNGs written by cameras), so that they can\n"
+    "                            be checked from then on. Nothing in the file is\n"
+    "                            moved or changed; a few hundred bytes are added\n"
+    "                            at its end. Damaged files are left alone\n"
+    "  -t, --keep-times          with --add, leave each file's modification time\n"
+    "                            as it was\n"
     "  -r, --recursive           descend into sub-folders\n"
     "  -j, --jobs <n>            threads in total (default: all cores)\n"
     "  -p, --parallel <n>        files checked at the same time (default: up to 4)\n"
@@ -331,6 +347,21 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
             s.profileAnyCamera = true;
         } else if (a == "-u" || a == "--update") {
             s.update = true;
+        } else if (a == "--update-by") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            if (*v == "time") {
+                s.updateByContent = false;
+            } else if (*v == "content") {
+                s.updateByContent = true;
+            } else {
+                std::fprintf(stderr, "dngconv: unknown choice '%s' for --update-by (use time or content)\n",
+                             v->c_str());
+                return false;
+            }
+            s.update = true;
+        } else if (a == "--no-source-record") {
+            s.sourceRecord = false;
         } else if (a == "-t" || a == "--keep-times") {
             s.keepTimes = true;
         } else if (a == "--no-preview") {
@@ -878,6 +909,10 @@ bool parseCheckArguments(const std::vector<std::string>& args, Settings& s, int&
             std::fputs(kCheckUsage, stdout);
             exitCode = 0;
             return false;
+        } else if (a == "-a" || a == "--add") {
+            s.addChecksums = true;
+        } else if (a == "-t" || a == "--keep-times") {
+            s.keepTimes = true;
         } else if (a == "-j" || a == "--jobs") {
             if (!parseCount(args, i, "dngconv check", s.threads)) return false;
         } else if (a == "-p" || a == "--parallel") {
@@ -913,15 +948,54 @@ int runCheck(const std::vector<std::string>& args) {
         return 1;
     }
 
+    // A file named twice is written to once.
+    if (settings.addChecksums) {
+        std::set<std::string> seen;
+        std::vector<Job> distinct;
+        for (Job& job : jobs) {
+            std::error_code ec;
+            const fs::path real = fs::weakly_canonical(job.input, ec);
+            if (seen.insert(ec ? job.input.u8string() : real.u8string()).second) distinct.push_back(std::move(job));
+        }
+        jobs = std::move(distinct);
+    }
+
     using State = DngCheck::State;
     enum class Outcome { Intact, Damaged, Unverified, Failed };
     std::vector<Outcome> outcomes(jobs.size(), Outcome::Failed);
+    std::vector<char> added(jobs.size(), 0);    // checksums were written into the file
+    std::vector<char> addable(jobs.size(), 0);  // they could be
     const ThreadPlan plan = planThreads(settings, jobs.size());
 
     const auto checkOne = [&](size_t index, JobReport& report) {
         const std::string name = show(jobs[index].input);
         try {
-            const DngCheck c = checkDng(jobs[index].input, plan.perFile);
+            DngCheck c;
+            std::string addedNote;  // what was written, to go in front of the verdict
+            if (settings.addChecksums) {
+                const fs::path& file = jobs[index].input;
+                std::error_code ec;
+                const fs::file_time_type time = fs::last_write_time(file, ec);
+                const bool haveTime = !ec;
+                const DngChecksumsAdded done = addDngChecksums(file, plan.perFile);
+                c = done.check;
+                if (done.any()) {
+                    added[index] = 1;
+                    addedNote = done.rawImage && done.original
+                                    ? "checksums added for the raw image and the embedded original; "
+                                    : done.rawImage ? "checksum added for the raw image; "
+                                                    : "checksum added for the embedded original; ";
+                    if (settings.keepTimes && haveTime) {
+                        fs::last_write_time(file, time, ec);
+                        if (ec)
+                            report.err += format("dngconv: %s: warning: could not set the time back: %s\n",
+                                                 name.c_str(), ec.message().c_str());
+                    }
+                }
+            } else {
+                c = checkDng(jobs[index].input, plan.perFile);
+                addable[index] = c.canAddChecksum ? 1 : 0;
+            }
             if (c.damaged()) {
                 // A file that is cut short usually has more than one thing
                 // wrong with it; the cause is the useful message.
@@ -933,8 +1007,9 @@ int runCheck(const std::vector<std::string>& args) {
                 report.out = format("%s: DAMAGED: %s\n", name.c_str(), what.c_str());
                 outcomes[index] = Outcome::Damaged;
             } else if (c.intact()) {
-                if (!settings.quiet)
-                    report.out = format("%s: intact (raw image%s)\n", name.c_str(),
+                // What was written to a file is said even with --quiet.
+                if (!settings.quiet || !addedNote.empty())
+                    report.out = format("%s: %sintact (raw image%s)\n", name.c_str(), addedNote.c_str(),
                                         c.original == State::Intact ? ", embedded original" : "");
                 outcomes[index] = Outcome::Intact;
             } else {
@@ -943,7 +1018,7 @@ int runCheck(const std::vector<std::string>& args) {
                     what += "; embedded original intact";
                 else if (c.original == State::Unverified)
                     what += "; embedded original " + c.originalDetail;
-                report.out = format("%s: not verified: %s\n", name.c_str(), what.c_str());
+                report.out = format("%s: %snot verified: %s\n", name.c_str(), addedNote.c_str(), what.c_str());
                 outcomes[index] = Outcome::Unverified;
             }
         } catch (const std::exception& e) {
@@ -961,12 +1036,19 @@ int runCheck(const std::vector<std::string>& args) {
         if (o == Outcome::Failed) ++failed;
     }
 
+    const int stamped = static_cast<int>(std::count(added.begin(), added.end(), 1));
+    const int couldStamp = static_cast<int>(std::count(addable.begin(), addable.end(), 1));
     if (!settings.quiet && jobs.size() > 1) {
         std::printf("%zu checked: %d intact, %d damaged", jobs.size(), intact, damaged);
         if (unverified) std::printf(", %d not verified", unverified);
         if (failed) std::printf(", %d not readable", failed);
+        if (settings.addChecksums) std::printf("; checksums added to %d", stamped);
         std::printf("\n");
     }
+    if (!settings.quiet && couldStamp)
+        std::printf("%s; 'dngconv check --add' writes %s.\n",
+                    couldStamp == 1 ? "1 file has no checksum" : format("%d files have no checksum", couldStamp).c_str(),
+                    couldStamp == 1 ? "it" : "them");
     return damaged || failed ? 1 : 0;
 }
 
@@ -984,6 +1066,11 @@ int main(int argc, char** argv) {
     int exitCode = 2;
     if (!parseArguments(args, settings, exitCode)) return exitCode;
 
+    if (settings.updateByContent && !settings.sourceRecord) {
+        std::fprintf(stderr, "dngconv: --update-by content relies on the record that --no-source-record "
+                             "leaves out; use one or the other\n");
+        return 2;
+    }
     if (settings.compression == DngCompression::JpegXl && !jxlAvailable() && !settings.info) {
         std::fprintf(stderr, "dngconv: this build has no JPEG XL support (it was built without libjxl); "
                              "use -c lossless\n");
@@ -1087,9 +1174,10 @@ int main(int argc, char** argv) {
     writeOptions.makerNotes = settings.makerNotes;
     writeOptions.lensCorrections = settings.lensCorrections;
     writeOptions.xmpSidecar = settings.sidecar;
+    writeOptions.sourceRecord = settings.sourceRecord;
     writeOptions.software = std::string("dngconv ") + kVersion;
 
-    enum class Outcome { Converted, UpToDate, Failed };
+    enum class Outcome { Converted, UpToDate, NoRecord, Failed };
     std::vector<Outcome> outcomes(jobs.size(), Outcome::Failed);
 
     const auto convertOne = [&](size_t index, JobReport& report) {
@@ -1113,10 +1201,37 @@ int main(int argc, char** argv) {
                 if (!sidecar.empty() && !ec && haveSourceTime) sourceTime = std::max(sourceTime, sidecarTime);
             }
 
+            std::string updateNote;  // why an existing DNG is being written again
+            bool digestKnown = false;
+            uint64_t knownSize = 0;
+            Md5Digest knownDigest{};
             if (fs::exists(target, ec)) {
                 if (fs::equivalent(target, job.input, ec))
                     throw std::runtime_error("output would overwrite the source file");
-                if (settings.update && !settings.force) {
+                if (settings.update && !settings.force && settings.updateByContent) {
+                    // By content: the DNG says which file it was made from.
+                    const SourceComparison compared = compareWithSource(target, job.input, settings.sidecar);
+                    if (compared.state == SourceComparison::State::NoRecord) {
+                        // Nothing to compare with. The DNG may be older than
+                        // this feature, come from another program, or have
+                        // been rewritten by one; none of that is a reason to
+                        // write over it.
+                        report.err += format("dngconv: %s: '%s' does not say which file it was made from, "
+                                             "so the two cannot be compared; left as it is (--force converts "
+                                             "it again)\n",
+                                             name.c_str(), show(target).c_str());
+                        outcomes[index] = Outcome::NoRecord;
+                        return;
+                    }
+                    if (compared.state == SourceComparison::State::UpToDate) {
+                        outcomes[index] = Outcome::UpToDate;
+                        return;
+                    }
+                    updateNote = ", " + compared.what;
+                    digestKnown = compared.digestKnown;
+                    knownSize = compared.fileSize;
+                    knownDigest = compared.fileDigest;
+                } else if (settings.update && !settings.force) {
                     const fs::file_time_type targetTime = fs::last_write_time(target, ec);
                     if (!ec && haveSourceTime && targetTime >= sourceTime) {
                         outcomes[index] = Outcome::UpToDate;
@@ -1137,6 +1252,7 @@ int main(int argc, char** argv) {
             ro.loadPreview = settings.preview == DngPreview::Auto || settings.preview == DngPreview::Camera;
             ro.keepOriginalFile = settings.embedOriginal;
             ro.readSidecar = settings.sidecar;
+            ro.digestSource = settings.sourceRecord && !digestKnown;
             RawReadResult source;
             try {
                 source = readRaw(job.input, ro);
@@ -1146,6 +1262,11 @@ int main(int argc, char** argv) {
                 throw;
             }
             if (source.sourceIsDng) throw std::runtime_error("already a DNG; skipped");
+            if (digestKnown && settings.sourceRecord) {
+                source.image.hasSourceDigest = true;
+                source.image.sourceFileSize = knownSize;
+                source.image.sourceFileDigest = knownDigest;
+            }
 
             if (target.has_parent_path()) {
                 fs::create_directories(target.parent_path(), ec);
@@ -1203,10 +1324,10 @@ int main(int argc, char** argv) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
                 const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
-                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s%s)\n", name.c_str(),
+                report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s%s%s)\n", name.c_str(),
                                     show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                                     megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
-                                    jxl ? ", JPEG XL" : "",
+                                    updateNote.c_str(), jxl ? ", JPEG XL" : "",
                                     lens.any() ? ", lens: " : "", lens.summary().c_str(),
                                     profileNote.c_str(), previewNote.c_str(),
                                     sidecar ? ", with " : "",
@@ -1225,15 +1346,17 @@ int main(int argc, char** argv) {
 
     runJobs(jobs.size(), plan.files, convertOne, [](size_t, const JobReport& report) { emitReport(report); });
 
-    int converted = 0, upToDate = 0, failed = allFound ? 0 : 1;
+    int converted = 0, upToDate = 0, noRecord = 0, failed = allFound ? 0 : 1;
     for (Outcome o : outcomes) {
         if (o == Outcome::Converted) ++converted;
         if (o == Outcome::UpToDate) ++upToDate;
+        if (o == Outcome::NoRecord) ++noRecord;
         if (o == Outcome::Failed) ++failed;
     }
-    if (!settings.quiet && (jobs.size() > 1 || upToDate)) {
+    if (!settings.quiet && (jobs.size() > 1 || upToDate || noRecord)) {
         std::printf("%d converted", converted);
         if (settings.update) std::printf(", %d already up to date", upToDate);
+        if (noRecord) std::printf(", %d left as %s (no record of the source)", noRecord, noRecord == 1 ? "it is" : "they are");
         std::printf(", %d failed\n", failed);
     }
     return failed ? 1 : 0;

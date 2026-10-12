@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib, and, if JPEG XL compression is wanted, libjxl.
 
-Status: **0.9.0, early**. It works on the cameras listed under
+Status: **0.10.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -46,11 +46,14 @@ Status: **0.9.0, early**. It works on the cameras listed under
 - `--verify` re-reads each DNG and compares every sample with the source.
 - `dngconv check` tells, years later, whether a DNG is still intact: it
   recomputes the checksums of the raw data and of the embedded original.
-  It works on DNGs from other converters too.
+  It works on DNGs from other converters too, and `check --add` **writes
+  the checksums into DNGs that have none**, which is most of those that
+  come straight out of a camera.
 - Made for whole folders: several files are converted at once, `--update`
-  skips what is already done, `--keep-times` gives each DNG the date of its
-  source, and an XMP sidecar next to a raw file (ratings, keywords, edits)
-  is taken into the DNG.
+  skips what is already done (judged by file times or, with `--update-by
+  content`, **by a checksum of the source** that each DNG carries),
+  `--keep-times` gives each DNG the date of its source, and an XMP sidecar
+  next to a raw file (ratings, keywords, edits) is taken into the DNG.
 - Writes through a temporary file, so an interrupted run leaves no half DNG.
 
 ## Download
@@ -105,6 +108,7 @@ dngconv IMG_0036.CR3                  # writes IMG_0036.dng next to it
 dngconv -o out/ *.NEF                 # into a folder
 dngconv -r -o ~/dng ~/photos/2026     # a whole tree, keeping its structure
 dngconv -r -u -t -o ~/dng ~/photos    # the same again later: only what is new
+dngconv -r --update-by content -o ~/dng ~/photos   # ... whatever the file dates say
 dngconv --verify -o safe.dng shot.ARW # convert, then prove nothing was lost
 dngconv -e -o archive/ *.CR3          # keep the camera file inside each DNG
 dngconv --lens-corrections none *.ARW # leave the lens corrections out
@@ -145,6 +149,11 @@ dngconv -i shot.RAF                   # show what the decoder finds
   -f, --force               overwrite existing DNG files
   -u, --update              skip files whose DNG exists and is not older than
                             the source; convert the others
+      --update-by <what>    how --update decides (and turns it on): time
+                            (default), or content: the source file and its
+                            sidecar are compared with the checksums noted in
+                            the DNG when it was made, whatever the file times
+      --no-source-record    do not note the source file's checksum in the DNG
   -t, --keep-times          give each DNG the modification time of its source
       --verify              re-read each DNG and compare it with the source
                             (pixels, and the embedded original if any)
@@ -172,6 +181,51 @@ since:
 $ dngconv -r -u -o ~/dng ~/photos
 3 converted, 4812 already up to date, 0 failed
 ```
+
+**Only what has changed, whatever the dates.** File times are a weak
+witness: copying an archive to another disk, restoring it from a backup or
+syncing it through a cloud service can give every file a new date, and a
+tool that edits a raw file's metadata may put the old date back. So every
+DNG carries a note of the file it was made from: its size and MD5, and the
+MD5 of the sidecar that went in with it. `--update-by content` compares that
+note with the files as they are now and ignores the dates:
+
+```
+$ dngconv -r --update-by content -o ~/dng ~/photos
+/home/me/photos/2024/IMG_0412.CR3 -> /home/me/dng/2024/IMG_0412.dng  (Canon EOS R8, 35.9 MB -> 34.7 MB, 1.7 s, sidecar changed, with IMG_0412.xmp)
+1 converted, 4814 already up to date, 0 failed
+```
+
+A file is converted again when its content or its sidecar's content differs
+from the note ("source changed", "sidecar added", "sidecar changed",
+"sidecar no longer there"), and when there is no DNG yet. What it costs is
+reading every source file once: about half a second for the 284 MB of the
+samples below, against nothing at all for the comparison of dates.
+
+A DNG without the note cannot be compared: one written by a version before
+0.10, by another program, or rewritten by a program that drops tags it does
+not know. dngconv then does not guess, and above all does not write over a
+file that may hold somebody's edits. It says so, leaves the DNG as it is and
+goes on; `--force` converts such files again, which gives them the note:
+
+```
+dngconv: IMG_0413.CR3: 'IMG_0413.dng' does not say which file it was made from, so the two cannot be compared; left as it is (--force converts it again)
+0 converted, 4814 already up to date, 1 left as it is (no record of the source), 0 failed
+```
+
+The note says nothing about how the DNG was made: a file converted without
+`-c jxl` is up to date for a run with it, as it is when going by dates. It
+is one line of text in a private TIFF tag (65300), there for anyone to read
+and to compare with `md5sum`:
+
+```
+$ exiftool -u -b -Exif_0xff14 IMG_0412.dng
+dngconv source record 1: size 37602962, MD5 9d77fb288859ac88e4f8762a37180849, sidecar MD5 d49de3def11d535505ed94036b9504d9
+$ md5sum IMG_0412.CR3
+9d77fb288859ac88e4f8762a37180849  IMG_0412.CR3
+```
+
+`--no-source-record` leaves it out.
 
 **Dates.** A new DNG normally carries the time of its conversion.
 `--keep-times` (`-t`) gives it the modification time of the raw file instead,
@@ -250,9 +304,17 @@ A DNG written by dngconv carries a checksum of its raw image data
 dngconv check shot.dng                # one file
 dngconv check -r ~/dng                # a whole archive
 dngconv check -q -r ~/dng             # only say what is not intact
+dngconv check --add -r ~/dng          # and give files without checksums theirs
 ```
 
 ```
+  -a, --add                 write the checksums into files that have none
+                            (most DNGs written by cameras), so that they can
+                            be checked from then on. Nothing in the file is
+                            moved or changed; a few hundred bytes are added
+                            at its end. Damaged files are left alone
+  -t, --keep-times          with --add, leave each file's modification time
+                            as it was
   -r, --recursive           descend into sub-folders
   -j, --jobs <n>            threads in total (default: all cores)
   -p, --parallel <n>        files checked at the same time (default: up to 4)
@@ -265,6 +327,7 @@ dngconv check -q -r ~/dng             # only say what is not intact
 2019/IMG_0414.dng: DAMAGED: the file is cut short: 300000 bytes are missing at its end
 2019/L1000123.dng: not verified: the file carries no checksum of its raw data
 4 checked: 1 intact, 2 damaged, 1 not verified
+1 file has no checksum; 'dngconv check --add' writes it.
 ```
 
 The exit status is 0 when no file is damaged, 1 when one is or could not be
@@ -273,7 +336,8 @@ read, 2 for a usage error. A file without a checksum counts as neither.
 It works on DNGs from other converters and from cameras. Files made by
 Adobe's software carry the same checksum (or its predecessor,
 `RawImageDigest`, which is understood too); most cameras that write DNG do
-not record one, and such files can only be checked for being complete.
+not record one, and such files can only be checked for being complete,
+until they are given one (below).
 
 What it covers, and what it cannot:
 
@@ -292,15 +356,69 @@ What it covers, and what it cannot:
   files are reported as "not verified". Lossy JPEG and JPEG XL data is
   checked without decoding: its checksum is of the compressed bytes.
 
+### Giving a file its checksums
+
+A DNG from a Leica, a Pentax, a drone or a phone usually has no checksum at
+all, so nothing can tell, later, whether it still is what the camera wrote.
+`dngconv check --add` computes the checksums such a file lacks and writes
+them into it:
+
+```
+$ dngconv check --add -t -r ~/leica
+2019/L1000123.dng: checksum added for the raw image; intact (raw image)
+2019/L1000124.dng: intact (raw image)
+2 checked: 2 intact, 0 damaged; checksums added to 1
+```
+
+From then on `dngconv check`, Adobe's software and anything else that reads
+the tags can verify the file. The same is done for an embedded original
+that came without a checksum.
+
+How the file is changed, since this is the one command that writes into
+files it did not make:
+
+- **Nothing in the file moves, and nothing is rewritten.** A TIFF header
+  points to the first directory, and everything else is found from there.
+  dngconv writes a copy of that directory, with the checksum in it, after
+  the end of the file and then changes the four bytes of the header that
+  point to it. The picture, the previews and the maker note stay byte for
+  byte where the camera put them. The file grows by the size of its first
+  directory (450 to 700 bytes on the six camera files tried); the old
+  directory stays behind, unused.
+- **In an order that survives a power cut.** The new directory is written
+  and forced to disk before the header changes. Up to that moment the file
+  is the old one with some bytes after its end that nothing refers to.
+- **Checked afterwards.** The file is read back as any reader would read
+  it; should the new checksum not verify, the file is put back as it was
+  and the failure reported.
+- **Only into sound files.** A file that is cut short, whose raw data does
+  not decode or whose embedded original does not unpack is reported as
+  damaged and not touched. A checksum that is there, right or wrong, is
+  never replaced.
+- The kind of checksum follows the file: `NewRawImageDigest` for DNG 1.4
+  and later, the older `RawImageDigest` for files that declare an earlier
+  version, so that the file contains nothing its own version does not know.
+- The file's date changes, as it does for any changed file; `-t` puts it
+  back. Running the command again does nothing.
+
+What a checksum added later can and cannot say: it vouches for the file as
+it was when the checksum was written, not as it left the camera. Damage
+that had already happened and still decodes (a flipped bit in uncompressed
+data) is sealed in with it. And raw data dngconv cannot read (floating
+point, Deflate, an image with a transparency mask) gets none; lossy JPEG
+data gets one, of its compressed bytes as the format defines, without having
+been decoded first.
+
 ## What has been tested
 
-Each file below was converted and then checked in up to ten ways:
+Each file below was converted and then checked in up to twelve ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
 2. **Same picture**: source and DNG were developed with identical settings
    through LibRaw and the 8-bit results compared pixel by pixel.
-3. **Readable elsewhere**: ExifTool's `-validate` reports no problem; darktable
+3. **Readable elsewhere**: ExifTool's `-validate` reports no error (and one
+   minor warning, for the private tag with the note of the source); darktable
    4.6 (which uses the independent rawspeed decoder) and RawTherapee 5.10
    develop the files with the expected colours and orientation.
 4. **Same metadata**: every EXIF, GPS and maker-note tag was read from source
@@ -336,6 +454,27 @@ Each file below was converted and then checked in up to ten ways:
     every sample back, and Adobe's DNG SDK 1.7.1, the reference reader for
     this compression, gets the same raw data out of each file as out of the
     lossless-JPEG DNG. See [JPEG XL compression](#jpeg-xl-compression).
+
+11. **Checksums written later**: the checksums were taken out of a copy of
+    each DNG and `dngconv check --add` asked to write them again. They come
+    back as the converter wrote them, and Adobe's validator accepts each
+    file. The same was done with 25 DNGs written by Adobe's code (its
+    DNG 1.7 sample files, and files its SDK wrote: uncompressed, lossless
+    and lossy JPEG, lossless and lossy JPEG XL, 8 and 16 bits): dngconv
+    writes the checksum Adobe had written, byte for byte. Six DNGs straight from
+    cameras, none of which had a checksum (DJI Phantom 4, LG Nexus 5X,
+    Leica T and X Vario, Pentax Q-S1; DNG 1.1, 1.3 and 1.4), were given
+    theirs: both of Adobe's validators (SDK 1.5.1 and 1.7.1) recompute and
+    accept them, report a deliberately falsified one, and say nothing they
+    did not say before; ExifTool and exiv2 list the same tags as before
+    plus the new one; LibRaw reads the same raw data and darktable develops
+    the same picture, pixel for pixel; apart from four header bytes, every
+    byte of the camera's file is still in place.
+
+12. **Updating by content**: after conversion, sources were given new and
+    old dates, one was changed and one DNG made without its note; a run
+    with `--update-by content` converted the changed file only and left
+    the DNG without a note alone.
 
 | Camera | Format | Sensor data | Source | DNG | DNG with `-c jxl` | Rendering difference |
 |---|---|---|---:|---:|---:|---|
@@ -814,6 +953,16 @@ way Adobe's SDK defines it, so any DNG reader can verify the raw data.
 `RawDataUniqueID` combines it with the camera model, crop and opcodes: two
 conversions of the same file get the same ID.
 
+**The private tag.** The note of a DNG's source (see
+[Working through a folder](#working-through-a-folder)) has no place in the
+DNG specification, so it sits in tag 65300, in the range TIFF leaves to
+private use. Adobe's validators say nothing about it; ExifTool's `-validate`
+mentions it as a minor warning ("Unknown IFD0 tag 0xff14") and keeps it when
+it rewrites a file. A program that rewrites a DNG from scratch may drop it;
+the DNG is then simply one that cannot be compared with its source any
+more. MD5 serves here, as in DNG's own checksums, to notice change, not to
+resist forgery.
+
 **Embedded originals and other programs.** The copy of the camera file
 includes everything in it, maker notes and GPS position too;
 `--no-maker-notes` does not reach inside it. Programs that rewrite a DNG may
@@ -883,13 +1032,15 @@ newer LibRaw.
 | `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/dng_digest.*` | The two raw image digests DNG defines |
-| `src/dng_check.*` | Reads a DNG's raw data as stored and compares the file with its checksums |
+| `src/dng_check.*` | Reads a DNG's raw data as stored, compares the file with its checksums, and works out the ones it lacks |
+| `src/dng_append.*` | Adds fields to the first directory of an existing file without moving anything in it |
+| `src/source_record.*` | The note of its source a DNG carries, and the comparison `--update-by content` rests on |
 | `src/parallel.hpp` | Runs a job list on all cores |
 | `src/tiff_writer.*` | Minimal TIFF container writer, either byte order, with values pinned to a file offset and blocks addressed by offset |
 | `src/sidecar.*` | Finds and reads XMP sidecar files |
 | `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), JPEG XL (fields and compressed-data checksums on hand-built files; with libjxl the codec and the writer's files, without it the refusals), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), the program itself run on generated DNGs, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), JPEG XL (fields and compressed-data checksums on hand-built files; with libjxl the codec and the writer's files, without it the refusals), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), keeping an archive (the note of the source and its comparison with files that change, fields added to a file in place in both byte orders, checksums written into files stripped of them, refusals on damaged and read-only files), the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

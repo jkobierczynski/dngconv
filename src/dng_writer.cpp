@@ -22,6 +22,7 @@
 #include "jpeg_encoder.hpp"
 #include "jxl_codec.hpp"
 #include "render.hpp"
+#include "source_record.hpp"
 #include "tiff_writer.hpp"
 
 namespace dngconv {
@@ -773,6 +774,16 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
     if (!img.bodySerial.empty()) ifd0.setAscii(tag::CameraSerialNumber, img.bodySerial);
     if (!img.originalFileName.empty())
         ifd0.setAscii(tag::OriginalRawFileName, img.originalFileName);
+    // Which file this was made from, for runs that update by content.
+    if (options.sourceRecord && img.hasSourceDigest) {
+        SourceRecord record;
+        record.present = true;
+        record.fileSize = img.sourceFileSize;
+        record.fileDigest = img.sourceFileDigest;
+        record.hasSidecar = options.xmpSidecar && !img.xmpSidecar.empty();
+        if (record.hasSidecar) record.sidecarDigest = Md5::of(img.xmpSidecar.data(), img.xmpSidecar.size());
+        ifd0.setAscii(kSourceRecordTag, packSourceRecord(record));
+    }
     // Focal length range and maximum apertures; an unknown aperture is NaN -> 0/0.
     const auto orUnknown = [](double v) { return v > 0 ? v : std::nan(""); };
     const std::vector<double> lensInfo = {img.lensInfo[0], img.lensInfo[1],

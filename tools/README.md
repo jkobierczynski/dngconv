@@ -21,6 +21,8 @@ there is a tool for:
   ok       check     15 checked: 15 intact, 0 damaged
   ok       extract   15 originals restored, identical to the sources
   ok       update    second run converted nothing; after touching one source, that one only
+  ok       content   touched sources not redone; the one with a changed byte redone, whatever its date; ...
+  ok       checksums 15 DNGs: 'check --add' writes the checksums the converter wrote, and dng_validate accepts them
   ok       times     DNG and restored original carry the source's time
   ok       sidecar   the sidecar's keyword is in the DNG, and is not with --no-sidecar
   ok       exiftool  no error in 15 DNGs
@@ -46,6 +48,8 @@ is 0 if no step that ran failed.
 | check | Each DNG agrees with its own checksums | dngconv |
 | extract | The originals come back byte for byte | dngconv, `cmp` |
 | update | `--update` skips what is done and redoes what changed | dngconv |
+| content | `--update-by content` goes by what is in the files: sources with new dates are not redone, one with a byte more under an old date is, and a DNG made without the note of its source is left as it is | dngconv |
+| checksums | With the checksums taken out of a copy of each DNG, `check --add` writes back exactly those the converter had written, changes nothing else in the file, and Adobe's reader accepts the result | Python; `dng_validate` if present |
 | times | `--keep-times` carries the date through conversion and extraction | dngconv |
 | sidecar | An XMP sidecar ends up in the DNG, and `--no-sidecar` prevents it | ExifTool |
 | exiftool | ExifTool's validation finds no error | ExifTool |
@@ -150,6 +154,19 @@ columns back in place, nothing else done) and compares them sample for
 sample. With a lossless-JPEG DNG and a JPEG XL DNG of the same raw file it
 shows that the reference reader gets the same data from both, which LibRaw
 cannot show because it does not read JPEG XL.
+
+**`compare_checksums.py DNG_FILE...`** tests `dngconv check --add` against
+checksums somebody else computed. It copies each DNG, takes the checksums
+(`RawImageDigest`, `NewRawImageDigest`, `OriginalRawFileDigest`) out of the
+copy, has dngconv write them again and compares: they must be the ones the
+file's own writer had put there, and apart from the pointer in the header
+no byte of the file as it was may have changed. Given DNGs from Adobe's
+software, that compares dngconv's arithmetic with Adobe's. A DNG without
+checksums, as most cameras write them, has nothing to compare with; it is
+given its checksums, and `dng_validate` (`--dng-validate`, or the
+`DNG_VALIDATE` variable) is asked whether it accepts them. The files named
+are never written to. Options: `--dngconv PATH` (default: the `DNGCONV`
+variable, or the PATH).
 
 **`compare_preview.py RAW_FILE DNG_FILE`** is for DNGs converted with
 `--preview render`. It takes the preview out of the DNG, decodes it, and

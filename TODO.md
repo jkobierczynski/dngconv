@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-11, at version 0.9.0.
+Last updated: 2026-10-12, at version 0.10.0.
 
 ## Needs someone with the software or an account
 
@@ -27,6 +27,13 @@ close the largest gaps in the verification.
       extract one of ours with "Extract originals", and run `dngconv extract`
       on a DNG that Adobe's converter embedded an original in.
 - [ ] **Unicode file names on Windows**, for conversion and for `extract`.
+- [ ] **`check --add` on macOS and Windows.** The unit tests run there
+      through the workflows, which covers the file handling (`_wfopen`,
+      `_commit`, `fsync`); no camera file has been given a checksum on
+      those systems, and none on a network drive anywhere.
+- [ ] **A camera DNG with added checksums in Lightroom or Camera Raw**, and
+      what those programs do to the checksum and to the note of the source
+      when they write metadata into a DNG.
 - [ ] **A Samsung DNG made by Adobe's converter**, to see how it stores the
       maker note in `DNGPrivateData`. ExifTool misreads our copy of it.
 
@@ -90,14 +97,29 @@ close the largest gaps in the verification.
         those systems.
 - [ ] **A library interface**, so other programs can use the reader and the
       writer without the command line.
+- [ ] **Updating by content: what the first version left open.**
+      - A way to give DNGs written before 0.10.0 the note of their source
+        without converting them again: decode the source, compare its
+        samples with the DNG's checksum, and add the note in place if they
+        agree (the machinery of `check --add` would do the writing).
+      - Show the note with `-i` on a DNG.
+      - A truncated DNG whose first directory is whole counts as up to
+        date, by content as by date; `check` finds it, `--update` does not.
+      - Whether the options a DNG was made with should count (a DNG made
+        without `-e` is up to date for a run with it).
 
 ## Smaller items
 
-- [ ] `check`: decode Deflate-compressed and floating-point raw data, so
-      that fewer files end up "not verified". (Lossy JPEG and JPEG XL are
-      checked by the checksum of their compressed data since 0.9.0.)
-- [ ] `check --add`: write the checksums into a DNG that has none, so that
-      camera-written DNGs can be watched from then on.
+- [ ] `check`: decode Deflate-compressed and floating-point raw data, and
+      take a transparency mask into the checksum, so that fewer files end
+      up "not verified" and `check --add` can serve them. (Lossy JPEG and
+      JPEG XL are checked by the checksum of their compressed data since
+      0.9.0.)
+- [ ] `check --add`: decode lossy JPEG data before giving it a checksum
+      (it gets one of its compressed bytes now, unseen), and add
+      `RawDataUniqueID` where a file has none.
+- [ ] `check --add` on macOS: `fsync` there does not reach the disk's own
+      cache; `F_FULLFSYNC` does.
 - [ ] Tile sizes that divide the frame evenly, so that no padding is needed
       at all (it is cheap since 0.5.1, not free).
 - [ ] Embed a camera's `.THM` sidecar with the original (forks 5 to 8 of
@@ -105,8 +127,6 @@ close the largest gaps in the verification.
 - [ ] Stream the original instead of holding the file and its packed copy in
       memory.
 - [ ] A `--byte-order` switch.
-- [ ] `--update` by content (a checksum of the source stored in the DNG)
-      for archives whose file times cannot be trusted.
 - [ ] Choose the number of files converted at once from the memory that is
       free, instead of the fixed four.
 - [ ] Detect an input that already is a DNG before decoding it. (Since
@@ -120,6 +140,9 @@ close the largest gaps in the verification.
 - [ ] A way to compare the raw samples a DNG stores with what LibRaw reads
       from it, as was done by hand for the `check` command (it needs a small
       program that dumps `readStoredRawImage`).
+- [ ] Camera-written DNGs with compressed raw data, to give checksums to:
+      the six tried are all uncompressed. (Compressed data was covered
+      with files from Adobe's code and from dngconv.)
 - [ ] Find sample files for the code paths no real file has exercised:
       four-colour sensors (CMYG, RGBE), monochrome sensors, non-square pixels,
       a source file with XMP.
@@ -144,6 +167,13 @@ close the largest gaps in the verification.
       whether that is what people expect.
 - [ ] **Should lens opcodes be mandatory, as Adobe's converter writes
       them?** They are flagged optional now, which lets a reader skip them.
+- [ ] **Tag 65300.** The note of a DNG's source sits in a private TIFF tag,
+      which costs a minor warning from ExifTool's validation in every
+      file. Kept, for want of a standard place; `--no-source-record` is the
+      way out for anyone who minds.
+- [ ] **A DNG without the note, when updating by content**: left alone
+      now. Converting it again was the alternative, and would write over
+      files that may hold edits.
 - [ ] **Name.** `dngconv` is a working name.
 - [ ] **Licence.** GPL-3.0-or-later was chosen without discussion. A library
       interface would raise the question again.

@@ -329,6 +329,117 @@ int main(int argc, char** argv) {
         CHECK(r.status == 2);
     }
 
+    // ---- check --add: checksums written into files that have none ---------------------------
+    {
+        const fs::path bare = gDir / "bare";
+        fs::create_directories(bare / "sub");
+        DngWriteOptions noDigests;
+        noDigests.digests = false;
+        writeDng(image(60, ""), bare / "a.dng", noDigests);
+        writeDng(image(61, "b.raw"), bare / "b.dng", noDigests);  // the embedded original has its checksum
+        writeDng(image(62, ""), bare / "c.dng");
+        {
+            // Without checksums, and with an embedded original that does not unpack.
+            const fs::path damaged = bare / "sub" / "damaged.dng";
+            writeDng(image(63, "damaged.raw"), damaged, noDigests);
+            const std::string bytes = tiffreader::slurp(damaged);
+            const tiffreader::Ifd ifd0 = tiffreader::parseFirstIfd(bytes);
+            std::fstream f(damaged, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp(static_cast<std::streamoff>(ifd0.at(50828).offset + 200));
+            f.put(static_cast<char>(bytes[ifd0.at(50828).offset + 200] ^ 0x55));
+        }
+        const fs::file_time_type past = fs::last_write_time(bare / "a.dng") - std::chrono::hours(24 * 400);
+        for (const char* name : {"a.dng", "b.dng", "c.dng"}) fs::last_write_time(bare / name, past);
+        const std::string before[3] = {tiffreader::slurp(bare / "a.dng"), tiffreader::slurp(bare / "b.dng"),
+                                       tiffreader::slurp(bare / "c.dng")};
+        const std::string folder = quoted(bare);
+
+        // Looking says what could be done, and does nothing.
+        Run r = run("check " + folder);
+        CHECK(r.status == 0);
+        CHECK(contains(r.out, "a.dng: not verified: the file carries no checksum of its raw data"));
+        CHECK(contains(r.out, "b.dng: not verified: the file carries no checksum of its raw data; embedded original intact"));
+        CHECK(contains(r.out, "c.dng: intact (raw image)"));
+        CHECK(contains(r.out, "3 checked: 1 intact, 0 damaged, 2 not verified"));
+        CHECK(contains(r.out, "2 files have no checksum; 'dngconv check --add' writes them."));
+        CHECK(tiffreader::slurp(bare / "a.dng") == before[0]);
+        r = run("check -q " + folder);
+        CHECK(r.status == 0 && lines(r.out) == 2 && !contains(r.out, "--add"));
+        r = run("check " + quoted(bare / "a.dng"));
+        CHECK(r.status == 0 && contains(r.out, "1 file has no checksum; 'dngconv check --add' writes it."));
+
+        // Adding, with the files' times kept.
+        r = run("check --add -t " + folder);
+        CHECK(r.status == 0 && r.err.empty());
+        CHECK(contains(r.out, "a.dng: checksum added for the raw image; intact (raw image)"));
+        CHECK(contains(r.out, "b.dng: checksum added for the raw image; intact (raw image, embedded original)"));
+        CHECK(contains(r.out, "c.dng: intact (raw image)"));
+        CHECK(contains(r.out, "3 checked: 3 intact, 0 damaged; checksums added to 2"));
+        CHECK(!contains(r.out, "have no checksum"));
+        const std::string after[3] = {tiffreader::slurp(bare / "a.dng"), tiffreader::slurp(bare / "b.dng"),
+                                      tiffreader::slurp(bare / "c.dng")};
+        for (int i = 0; i < 2; ++i) {
+            CHECK(after[i].size() > before[i].size() && after[i].size() < before[i].size() + 2000);
+            CHECK(after[i].compare(8, before[i].size() - 8, before[i], 8, before[i].size() - 8) == 0);
+            CHECK(tiffreader::parseFirstIfd(after[i]).count(51111));
+        }
+        CHECK(after[2] == before[2]);
+        for (const char* name : {"a.dng", "b.dng", "c.dng"}) CHECK(sameTime(fs::last_write_time(bare / name), past));
+
+        // Again: nothing left to do, nothing touched.
+        r = run("check -a " + folder);
+        CHECK(r.status == 0 && contains(r.out, "3 checked: 3 intact, 0 damaged; checksums added to 0"));
+        CHECK(tiffreader::slurp(bare / "a.dng") == after[0] && tiffreader::slurp(bare / "b.dng") == after[1]);
+        CHECK(sameTime(fs::last_write_time(bare / "a.dng"), past));
+        r = run("check " + folder);
+        CHECK(r.status == 0 && contains(r.out, "3 checked: 3 intact, 0 damaged") && !contains(r.out, "--add"));
+
+        // Without -t a changed file has a new time; what was written is
+        // said even with -q; one file alone gets no summary.
+        writeDng(image(64, ""), bare / "d.dng", noDigests);
+        fs::last_write_time(bare / "d.dng", past);
+        r = run("check -q --add " + quoted(bare / "d.dng"));
+        CHECK(r.status == 0 && lines(r.out) == 1);
+        CHECK(contains(r.out, "d.dng: checksum added for the raw image; intact (raw image)"));
+        CHECK(!sameTime(fs::last_write_time(bare / "d.dng"), past));
+
+        // A file named twice is done once.
+        writeDng(image(65, ""), bare / "e.dng", noDigests);
+        r = run("check --add -p 2 " + quoted(bare / "e.dng") + " " + quoted(bare / "sub" / ".." / "e.dng"));
+        CHECK(r.status == 0 && lines(r.out) == 1 && contains(r.out, "checksum added for the raw image; intact"));
+        fs::remove(bare / "e.dng");
+
+        // A damaged file is reported and left exactly as it is.
+        const std::string damagedBefore = tiffreader::slurp(bare / "sub" / "damaged.dng");
+        for (const char* threads : {"-p 1", "-p 3 -j 6"}) {
+            r = run(std::string("check --add -r ") + threads + " " + folder);
+            CHECK(r.status == 1);
+            CHECK(contains(r.out, "damaged.dng: DAMAGED:") && !contains(r.out, "damaged.dng: checksum"));
+            CHECK(contains(r.out, "5 checked: 4 intact, 1 damaged; checksums added to 0"));
+            CHECK(tiffreader::slurp(bare / "sub" / "damaged.dng") == damagedBefore);
+        }
+        r = run("check --help");
+        CHECK(r.status == 0 && contains(r.out, "--add") && contains(r.out, "--keep-times"));
+    }
+
+    // ---- updating by content: the options -----------------------------------------------------
+    {
+        const std::string missing = quoted(gDir / "no-such-file.raw");
+        Run r = run("--update-by sideways " + missing);
+        CHECK(r.status == 2 && contains(r.err, "use time or content"));
+        r = run("--update-by");
+        CHECK(r.status == 2);
+        r = run("--update-by content --no-source-record " + missing);
+        CHECK(r.status == 2 && contains(r.err, "--no-source-record"));
+        for (const char* options : {"--update-by content", "--update-by time", "-u --update-by content", "--no-source-record",
+                                    "--update-by time --no-source-record"}) {
+            r = run(std::string(options) + " " + missing);
+            CHECK(r.status == 1 && contains(r.err, "no such file"));
+        }
+        r = run("--help");
+        CHECK(r.status == 0 && contains(r.out, "--update-by") && contains(r.out, "--no-source-record"));
+    }
+
     fs::remove_all(gDir, ec);
     return testutil::finish("test_cli");
 }

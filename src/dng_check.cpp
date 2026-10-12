@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "dng_append.hpp"
 #include "dng_digest.hpp"
 #include "jxl_codec.hpp"
 #include "ljpeg92.hpp"
@@ -48,6 +49,7 @@ constexpr uint32_t kCompressionLossyJpeg = 34892;
 constexpr uint32_t kCompressionJxl = 52546;
 constexpr uint16_t kExtraCameraProfiles = 50933;
 constexpr uint16_t kRawImageDigest = 50972;
+constexpr uint16_t kOriginalRawFileDigest = 50973;
 constexpr uint16_t kNewRawImageDigest = 51111;
 
 // Largest image this will hold in memory: 600 million samples, 1.2 GB.
@@ -443,7 +445,31 @@ StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned th
     return image;
 }
 
-DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
+namespace {
+
+// The checksums a file lacks and could be given.
+struct Missing {
+    bool raw = false;
+    uint16_t rawTag = 0;
+    Md5Digest rawDigest{};
+    bool original = false;
+    Md5Digest originalDigest{};
+};
+
+// A checksum over an image with a transparency mask takes the mask in, which
+// this code does not read.
+const char* const kNoneWithMask = ", and none can be worked out for an image with a transparency mask";
+
+// Whether the file declares DNG 1.4 or later, the version NewRawImageDigest
+// came with. Older files get the checksum their own version defines.
+bool knowsNewDigest(const Tiff& tiff, const std::vector<Entry>& ifd0) {
+    const Entry* e = find(ifd0, kDngVersion);
+    std::vector<uint8_t> v;
+    if (!e || e->count != 4 || !loadValue(tiff, *e, 4, v)) return true;
+    return v[0] > 1 || (v[0] == 1 && v[1] >= 4);
+}
+
+DngCheck examine(const std::filesystem::path& path, unsigned threads, Missing& missing) {
     DngCheck result;
     Source src(path);
     Opened dng;
@@ -489,6 +515,13 @@ DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
                     }
                     result.rawImage = DngCheck::State::Unverified;
                     result.rawDetail = "the file carries no checksum of its raw data";
+                    if (!hasMask) {
+                        missing.rawDigest = compressedDataDigest(tiff, *rawIfd, l, threads);
+                        missing.rawTag = kNewRawImageDigest;
+                        missing.raw = true;
+                    } else {
+                        result.rawDetail += kNoneWithMask;
+                    }
                 } else if (hasMask) {
                     result.rawImage = DngCheck::State::Unverified;
                     result.rawDetail = "cannot check: the image has a transparency mask";
@@ -516,6 +549,20 @@ DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
             if (!hasNew && !hasOld) {
                 result.rawImage = DngCheck::State::Unverified;
                 result.rawDetail = "the file carries no checksum of its raw data";
+                if (!hasMask) {
+                    if (knowsNewDigest(tiff, ifd0)) {
+                        missing.rawTag = kNewRawImageDigest;
+                        missing.rawDigest = newRawImageDigest(image.samples.data(), image.width, image.height,
+                                                              image.planes, bytesPerSample, threads);
+                    } else {
+                        missing.rawTag = kRawImageDigest;
+                        missing.rawDigest =
+                            rawImageDigest(image.samples.data(), image.width, image.height, image.planes);
+                    }
+                    missing.raw = true;
+                } else {
+                    result.rawDetail += kNoneWithMask;
+                }
             } else if (hasNew && hasMask) {
                 result.rawImage = DngCheck::State::Unverified;
                 result.rawDetail = "cannot check: the image has a transparency mask";
@@ -555,13 +602,89 @@ DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
                 result.original = original.hasDigest ? DngCheck::State::Intact : DngCheck::State::Unverified;
                 result.originalDetail = original.hasDigest ? "OriginalRawFileDigest"
                                                            : "unpacks, but the file carries no checksum of it";
+                if (!original.hasDigest) {
+                    missing.originalDigest = Md5::of(original.packed.data(), original.packed.size());
+                    missing.original = true;
+                }
             }
         }
     } catch (const std::exception& e) {
         result.original = DngCheck::State::Damaged;
         result.originalDetail = e.what();
     }
+    // Nothing is to be stamped on a file that is not sound as far as can be
+    // told, and a malformed checksum tag is not replaced.
+    if (result.damaged()) missing = Missing{};
+    if (missing.raw && find(ifd0, missing.rawTag)) missing.raw = false;
+    if (missing.original && find(ifd0, kOriginalRawFileDigest)) missing.original = false;
+    result.canAddChecksum = missing.raw || missing.original;
     return result;
+}
+
+}  // namespace
+
+DngCheck checkDng(const std::filesystem::path& path, unsigned threads) {
+    Missing missing;
+    return examine(path, threads, missing);
+}
+
+DngChecksumsAdded addDngChecksums(const std::filesystem::path& path, unsigned threads) {
+    return detail::addDngChecksums(path, threads,
+                                   [threads](const std::filesystem::path& file) { return checkDng(file, threads); });
+}
+
+DngChecksumsAdded detail::addDngChecksums(const std::filesystem::path& path, unsigned threads,
+                                          const std::function<DngCheck(const std::filesystem::path&)>& recheck) {
+    DngChecksumsAdded done;
+    Missing missing;
+    done.check = examine(path, threads, missing);  // the file is closed again when this returns
+    if (!missing.raw && !missing.original) return done;
+
+    std::vector<TiffField> fields;
+    const auto add = [&](uint16_t tag, const Md5Digest& digest) {
+        TiffField f;
+        f.tag = tag;
+        f.type = 1;  // BYTE, as the specification has it
+        f.count = static_cast<uint32_t>(digest.size());
+        f.data.assign(digest.begin(), digest.end());
+        fields.push_back(std::move(f));
+    };
+    if (missing.raw) add(missing.rawTag, missing.rawDigest);
+    if (missing.original) add(kOriginalRawFileDigest, missing.originalDigest);
+
+    AppendReceipt receipt;
+    try {
+        receipt = appendToFirstIfd(path, fields);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("cannot add checksums: ") + e.what());
+    }
+
+    // Read it back as any reader would. What was just written must verify,
+    // and nothing else may have changed for the worse.
+    std::string wrong;
+    try {
+        const DngCheck after = recheck(path);
+        if (after.damaged())
+            wrong = after.truncated ? after.truncatedDetail
+                                    : (after.rawImage == DngCheck::State::Damaged ? after.rawDetail : after.originalDetail);
+        else if (missing.raw && after.rawImage != DngCheck::State::Intact)
+            wrong = "the checksum of the raw image was not found again";
+        else if (missing.original && after.original != DngCheck::State::Intact)
+            wrong = "the checksum of the embedded original was not found again";
+        done.check = after;
+    } catch (const std::exception& e) {
+        wrong = e.what();
+    }
+    if (!wrong.empty()) {
+        undoAppend(path, receipt);
+        throw std::runtime_error("the file did not verify after its checksums were added (" + wrong +
+                                 "); it was put back as it was");
+    }
+    done.rawImage = missing.raw;
+    if (missing.raw) done.rawTag = missing.rawTag == kNewRawImageDigest ? "NewRawImageDigest" : "RawImageDigest";
+    done.original = missing.original;
+    done.bytesAdded = receipt.newSize - receipt.oldSize;
+    return done;
 }
 
 }  // namespace dngconv

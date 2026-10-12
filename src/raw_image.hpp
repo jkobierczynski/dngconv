@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "lens_correction.hpp"
+#include "md5.hpp"
 
 namespace dngconv {
 
@@ -162,6 +163,12 @@ struct RawImage {
     // Every byte of the file the image was decoded from, when it is to be
     // embedded in the DNG so that the conversion can be undone. Empty otherwise.
     std::vector<uint8_t> originalFile;
+
+    // Size and MD5 of that file, when the reader took them: noted in the DNG
+    // so that a later run can tell whether the source has changed since.
+    bool hasSourceDigest = false;
+    uint64_t sourceFileSize = 0;
+    Md5Digest sourceFileDigest{};
 
     // ---- embedded preview ---------------------------------------------------
     // A complete JPEG stream taken unchanged from the source file, or empty.

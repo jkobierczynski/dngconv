@@ -85,6 +85,10 @@ struct DngWriteOptions {
     /// (ExtraCameraProfiles). Each must describe as many colour planes as the
     /// image has. Ignored for monochrome images.
     std::vector<std::shared_ptr<const CameraProfile>> profiles;
+    /// Note in the DNG which source file it was made from: the size and MD5
+    /// of the file (RawImage::sourceFileDigest, when the reader took it) and
+    /// the MD5 of the sidecar stored with it. See source_record.hpp.
+    bool sourceRecord = true;
     DngByteOrder byteOrder = DngByteOrder::MatchSource;
     /// Value of the TIFF Software tag.
     std::string software = "dngconv";

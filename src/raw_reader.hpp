@@ -25,6 +25,9 @@ struct RawReadOptions {
     /// Keep a copy of the whole source file in RawImage::originalFile, for
     /// embedding in the DNG.
     bool keepOriginalFile = false;
+    /// Take the size and MD5 of the source file (RawImage::sourceFileDigest),
+    /// for the note of its source a DNG carries. Not done with metadataOnly.
+    bool digestSource = true;
     /// Skip pixel decoding; only metadata and geometry are filled in.
     bool metadataOnly = false;
 };

@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-11, at version 0.9.0.
+Last updated: 2026-10-12, at version 0.10.0.
 
 ## Status at a glance
 
@@ -24,7 +24,9 @@ Last updated: 2026-10-11, at version 0.9.0.
 | Defect pixels | Flagged with a DNG opcode (Panasonic and similar) |
 | Embedded original (`--embed-original`, `extract`) | Working; all 15 samples restored byte-identical, by dngconv and by ExifTool |
 | Checking existing DNGs (`check`) | Working; agrees with Adobe's validator on sound and damaged files, also for DNGs written by Adobe's SDK and by cameras |
+| Writing missing checksums into existing DNGs (`check --add`) | Working; the same checksums as Adobe's code on 25 of its files, accepted by both validators on six camera-written DNGs, nothing else in the file changed |
 | Batch work (`--update`, `--keep-times`, several files at once, XMP sidecars) | Working; clean under the thread sanitizer |
+| Updating by content (`--update-by content`, the note of its source in each DNG) | Working |
 | Lens corrections as opcodes | Sony, Fujifilm, Panasonic, Olympus; distortion checked against each camera's own JPEG on five files |
 | Linux build, GCC and Clang | Tested |
 | LibRaw 0.21.2 and 0.22.0 | Both tested |
@@ -533,6 +535,85 @@ Decisions:
 - **Sixteen bits declared for every tile**, whatever the sensor's depth, as
   Adobe does. Declaring twelve would save the container, and little else.
 
+### 0.10.0 (2026-10-12): the archive side
+
+1. **`check --add`** (`-a`): writes the checksums into DNGs that have none.
+   The raw image gets `NewRawImageDigest`, or `RawImageDigest` if the file
+   declares a DNG version before 1.4; an embedded original without a
+   checksum gets `OriginalRawFileDigest`. `-t` keeps the file's date.
+   Plain `check` now says how many files could be given a checksum.
+2. **Adding to a file in place** (`dng_append.*`): a copy of the first
+   directory, with the new fields, goes after the end of the file, and the
+   header is pointed to it. Nothing else is written. The new directory is
+   forced to disk before the header changes; the file is read back
+   afterwards and put back as it was if the result does not verify.
+3. **The note of its source in every DNG** (`source_record.*`): size and
+   MD5 of the source file and the MD5 of the sidecar stored with it, as a
+   line of text in private tag 65300. The reader takes the MD5 on a thread
+   of its own while LibRaw decodes. `--no-source-record` leaves it out.
+4. **`--update-by content`**: decides by that note instead of by file
+   times. A DNG without the note is left as it is and reported.
+5. `tools/compare_checksums.py`; steps `content` and `checksums` in
+   `verify.sh` (16 steps now); a fourteenth test program, `test_archive`.
+
+Findings:
+
+| Finding | Resolution |
+|---|---|
+| Six DNGs straight from cameras (DJI Phantom 4 twice, LG Nexus 5X, Leica T, Leica X Vario, Pentax Q-S1) carry no checksum of any kind, and declare DNG 1.4, 1.4, 1.4, 1.3, 1.3 and 1.1. `NewRawImageDigest` came with 1.4. | The checksum follows the file's version: three of the six got `NewRawImageDigest`, three `RawImageDigest`. Adobe's validators (1.5.1 and 1.7.1) recompute either kind ("FindRawImageDigest time" appears in their output only for files that have one) and accept all six. |
+| Does the validator really compare, or just read past the tag? | One byte of the checksum falsified in three files (new kind, old kind, JPEG XL): "NewRawImageDigest does not match raw image", "RawImageDigest does not match raw image", "NewRawImageDigest does not match Lossy Compressed image". |
+| The checksum of lossy JPEG data (compression 34892) had been taken from the SDK's source in 0.9.0 but never compared with a file, for lack of one. | `dng_validate -proxy` of SDK 1.5.1 writes such files, `-lossyMosaicJXL` and `-proxy` of 1.7.1 lossy JPEG XL ones. Stripped of their checksum and given it again by `check --add`, all four get back what Adobe wrote. |
+| A file of odd length (one of the DJI files) needs a byte of padding before the new directory: TIFF wants directories on even offsets. | Padded; the growth is 562 bytes for one DJI file and 563 for the other. |
+| Where can the note of the source live? DNG has no tag for it. `OriginalRawFileDigest` is defined as the checksum of the embedded copy. `DNGPrivateData` is taken by Adobe's maker-note format. XMP would mean editing the user's sidecar text before embedding it. TIFF/EP's `ImageHistory` fits the meaning, but ExifTool's `-validate` calls it non-standard in either directory it can go in, the same minor warning an unknown tag gets. | A private tag (65300; ExifTool knows 65000 to 65112 from other programs, so away from those), holding text that says what it is. Adobe's validators say nothing; ExifTool: "[minor] Unknown IFD0 tag 0xff14", and it keeps the tag when it rewrites the file. The README no longer says ExifTool reports no problem at all. |
+| The first reader of the note refused the largest possible file size: the guard against overflow was `size > (max - 9) / 10` whatever the digit. | Guard uses the digit at hand. Found by the test that writes and reads back `UINT64_MAX`. |
+| What to do, updating by content, with a DNG that has no note? Converting it again is what `--update` would suggest, but such a DNG may be from another program, or may have been edited by one that dropped the tag, and the times that would tell are exactly what the user said not to trust. | Left as it is, with a message; counted separately; exit status 0. `--force` converts it. |
+| Taking the MD5 costs a second pass over the source file. | Done on its own thread during decoding: 11.3 s for the 16 samples with and without it (three runs each, differences within the noise). When the file is kept for embedding, the copy in memory is hashed instead. |
+| A file named twice on the command line of `check --add` would be written to by two threads. | Files are made distinct by their canonical path first. The append also writes at the offset it computed, not "at the end", so that two identical appends that did meet would write the same bytes to the same place. |
+| A disk that fills up while the new directory is written leaves part of it behind. | The file is cut back to its old length; the header was not touched yet. Tried with a file-size limit (`ulimit -f`) that allows none, and 200, of the 466 bytes: the file is identical to the original both times, and the failure is reported. |
+| A checksum added later cannot know what the file was before. Of 60 randomly damaged copies of a lossless-JPEG DNG, 25 were given one: the damage was in a part no checksum covers (previews, metadata), or in the raw data in a way that still decodes, which lossless JPEG, having no integrity of its own, often allows. | Nothing to be done, and said in the README: the checksum vouches for the file as it was when it was added. Damage that makes the data undecodable, a file that is cut short and an embedded original that does not unpack are caught, and such files are not written to. |
+
+How it was verified:
+
+| Check | Result |
+|---|---|
+| `compare_checksums.py` on 25 DNGs written by Adobe's code: its twelve readable DNG 1.7 sample files (two more are floating point or have a transparency mask), six JPEG XL files from `dng_validate -losslessJXL`, three lossless-JPEG files from SDK 1.5.1 (8 bits with and without a table, 12 bits), and the four lossy ones above | the checksum dngconv writes is Adobe's, byte for byte, in all 25; `dng_validate` 1.7.1 accepts every stamped copy |
+| The same on dngconv's own files: the 15 samples with embedded originals (in `verify.sh`), and lossless JPEG, JPEG XL and uncompressed variants | raw and original checksums come back as written |
+| Six camera-written DNGs given their checksums | `dng_validate` 1.5.1 and 1.7.1: same output as before plus the line that the checksum was computed, no new warning; ExifTool `-a -u -G1`: the same tags plus the one added; ExifTool `-validate` and exiv2: the same remarks as before; rawpy (LibRaw 0.22.1): raw data and developed picture identical; darktable 4.6.1 (three of them): developed picture identical pixel for pixel; byte comparison: the old file is a prefix of the new one except for bytes 4 to 7 |
+| Rewritten by ExifTool afterwards (`-Artist=`) | `check`: still intact; the note of the source still there and still matching |
+| Interrupted between the two writes (simulated: new directory appended, old header) | reads as the old file, not damaged, not "cut short"; the next `--add` completes |
+| Read-only file (as an unprivileged user), full disk, damaged files, a wrong or malformed checksum already present | refused or reported; file byte-identical afterwards |
+| The file failing to verify when read back (a test puts a fault-finding reader in the place of the real one, since nothing from outside makes that happen) | reported; file byte-identical afterwards |
+| `--update-by content` on real files (`verify.sh`, and by hand): all dates changed; one byte appended under an old date; sidecar added, changed, removed, `--no-sidecar`; a DNG from an earlier version; one made with `--no-source-record` | converted exactly the files that changed, with the reason in the report; DNGs without a note left alone |
+| The note against `md5sum` | same digest for the three files compared |
+| Sanitizers | ASan and UBSan: tests clean; `check --add` on 420 damaged copies of seven DNGs (four writers; checksums removed first): 204 left untouched, 216 given checksums and then found intact by `check`, none written to in any other way, no finding. TSan: `check --add -p 4` on 26 files and parallel conversion with `--update-by content`, no report |
+| All builds | 14 of 14 tests with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18, libjxl 0.7.0, 0.11.1 and none; `test_archive` also as an unprivileged user, for the read-only case |
+
+Decisions:
+
+- **Append, do not rewrite.** Writing the DNG out again would be the
+  obvious way to add a tag, and would move every byte of a file this
+  program did not make: maker notes with absolute pointers, private
+  structures no parser here understands. Appending touches four bytes.
+  The price is a dead copy of the directory in the file.
+- **In place, not through a temporary copy.** A copy and a rename would be
+  as safe, but costs writing the whole file again, and loses hard links
+  and whatever attributes the copy does not carry. The order of the two
+  writes, with a sync between them, gives the same safety.
+- **A checksum that is there is never replaced**, even when it is wrong: a
+  wrong one is the evidence that something happened to the file.
+- **The note is text.** Fifty-odd bytes more than a binary record, and
+  anyone who finds an unknown tag in a file can read what it is and check
+  it with `md5sum`.
+- **The note covers the sidecar, not the options.** A changed rating
+  should bring a new DNG; a different `--preview-size` on the command line
+  is a decision about new files, not a change of the old ones. Going by
+  dates behaves the same.
+- **MD5**, as in DNG's own checksums: the purpose is to notice change, and
+  every system has a tool to compute it.
+- **`--update` stays with dates by default.** It costs nothing and is what
+  the option has always done; reading every source file is something to
+  ask for.
+
 ## Design decisions
 
 **LibRaw for decoding, own code for writing.** LibRaw covers the cameras; the
@@ -662,11 +743,11 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (13 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
+| Unit tests (14 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, checksums added to files in place and the note of a DNG's source, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
-| Structure | ExifTool 12.76 `-validate` | No complaints beyond those the source file already has, except two minor warnings about the private-data copy of the Samsung maker note |
+| Structure | ExifTool 12.76 `-validate` | No error. Warnings beyond those the source file already has: two minor ones about the private-data copy of the Samsung maker note, and since 0.10.0 a minor one in every file about the private tag with the note of the source |
 | Independent decoders | darktable 4.6.1 (rawspeed), RawTherapee 5.10 | The files open elsewhere, with the right colours and orientation, including big-endian and uncompressed ones |
 | Thumbnail | Pillow, reading IFD0 as a plain TIFF | A generic TIFF reader finds and shows the thumbnail; looked at next to the camera previews for all 15 files |
 | Metadata comparison | ExifTool 12.76, exiv2 0.27.6 | Each maker-note, EXIF and GPS tag has the same value in source and DNG |
@@ -674,11 +755,12 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, geometry | Adobe `dng_validate` (render with opcodes), darktable 4.6.1 (lens module, embedded metadata), OpenCV SIFT matching against the camera's JPEG | Two independent readers apply our opcodes and arrive at the camera's own geometry and framing |
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
+| Checksums written into existing files (`check --add`) | Adobe's code as the writer of 25 files whose checksums are reproduced; `dng_validate` 1.5.1 and 1.7.1, ExifTool, exiv2, LibRaw and darktable as readers of six camera files before and after | The arithmetic is Adobe's for every kind of raw data dngconv reads, and a file is the same file afterwards; see the 0.10.0 history |
 | JPEG XL | Adobe `dng_validate` 1.7.1 as reader (stage 1 image compared) and as writer; libjxl 0.7.0 and 0.11.1 | The reference reader gets the same raw data from a JPEG XL DNG as from the lossless-JPEG one, and dngconv reads Adobe's files; see the 0.9.0 history |
 | Rendered previews | libjpeg (Pillow, OpenCV), OpenCV SIFT matching against the camera's JPEG | The encoder writes what libjpeg would; the rendered picture has the camera's geometry and, within the spread between cameras, its tones; see the 0.8.0 history |
 | Camera profiles | ExifTool (tag values, and as the writer of a reference DNG), Adobe `dng_validate` (parsing, rendering, rewriting) | The embedded profile is the `.dcp` file's, and is developed as such; see the 0.7.0 history |
-| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, and on `check` run over 300 damaged copies of six DNGs from three writers |
-| Threads | GCC 13 thread sanitizer | Parallel conversion, checking and extraction of all samples, and the unit tests, with LibRaw's own OpenMP threads excluded |
+| Memory and undefined behaviour | GCC 13 ASan and UBSan | Clean on the tests (leak detection on), on full conversions with and without `-e`, on extraction, on truncated and byte-flipped copies of real raw files, and on `extract` and `-i` run over 60 truncated or overwritten copies of a DNG with an embedded original, on `-i` run over 300 damaged copies of the five files with lens data, the damage aimed at the directories the lens parsers read, on `check` run over 300 damaged copies of six DNGs from three writers, and on `check --add` run over 420 damaged copies of seven DNGs from four writers, where every copy also had to come out either untouched or sound |
+| Threads | GCC 13 thread sanitizer | Parallel conversion (with the checksum of the source taken on its own thread), checking, adding checksums and extraction, and the unit tests, with LibRaw's own OpenMP threads excluded |
 | Second compiler | Clang 18 | No warnings at `-Wall -Wextra -Wpedantic` |
 
 `dng_validate` is not part of this repository and is not needed to build or

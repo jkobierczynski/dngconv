@@ -16,6 +16,11 @@
 #   check        dngconv check                    every DNG intact by its own checksums
 #   extract      dngconv extract, cmp             originals restored byte for byte
 #   update       dngconv -u, twice                nothing redone; a touched file redone
+#   content      dngconv --update-by content      touched files not redone; a changed one is; a DNG
+#                                                 that does not name its source is left alone
+#   checksums    compare_checksums.py             (Python) checksums taken out of each DNG and written
+#                                                 again by 'check --add' are the same; with
+#                                                 dng_validate, Adobe's reader accepts them
 #   times        dngconv -t, extract -t           dates carried over
 #   sidecar      dngconv with an .xmp             (ExifTool) keywords arrive in the DNG
 #   exiftool     exiftool -validate               (ExifTool) no error in any DNG
@@ -137,6 +142,61 @@ if grep -q "^0 converted, $count already up to date, 0 failed" "$work/update2.lo
     passed update "second run converted nothing; after touching one source, that one only"
 else
     failed update "see $work/update2.log and update3.log"
+fi
+
+# ---- update by content --------------------------------------------------------
+mkdir -p "$work/content/src"
+head -n 3 "$work/restored.list" | while IFS= read -r file; do cp "$file" "$work/content/src/"; done
+"$dngconv" -q -o "$work/content/out" "$work/content/src" >"$work/content0.log" 2>&1
+# Every source is now newer than its DNG: by time, all would be redone.
+sleep 1
+find "$work/content/src" -type f -exec touch {} +
+"$dngconv" --update-by content -o "$work/content/out" "$work/content/src" >"$work/content1.log" 2>&1
+# One more byte at the end of one source (decoders do not mind), under an old date.
+changed=$(find "$work/content/src" -type f | sort | head -n 1)
+printf 'x' >>"$changed"
+find "$work/content/src" -type f -exec touch -t 200101010000.00 {} +
+"$dngconv" --update-by content -o "$work/content/out" "$work/content/src" >"$work/content2.log" 2>&1
+"$dngconv" --update-by content -o "$work/content/out" "$work/content/src" >"$work/content3.log" 2>&1
+# A DNG that does not say what it was made from is not written over.
+"$dngconv" -q -f --no-source-record -o "$work/content/out" "$changed" >"$work/content4.log" 2>&1
+plain=$(cksum <"$work/content/out/$(basename "${changed%.*}").dng")
+"$dngconv" --update-by content -o "$work/content/out" "$work/content/src" >>"$work/content4.log" 2>&1
+if grep -q "^0 converted, $count already up to date, 0 failed" "$work/content1.log" &&
+   grep -q "^1 converted, $((count - 1)) already up to date, 0 failed" "$work/content2.log" &&
+   grep -q ', source changed' "$work/content2.log" &&
+   grep -q "^0 converted, $count already up to date, 0 failed" "$work/content3.log" &&
+   grep -q "^0 converted, $((count - 1)) already up to date, 1 left as it is" "$work/content4.log" &&
+   [ "$plain" = "$(cksum <"$work/content/out/$(basename "${changed%.*}").dng")" ]; then
+    passed content "touched sources not redone; the one with a changed byte redone, whatever its date; a DNG without a record of its source left alone"
+else
+    failed content "see $work/content1.log to content4.log"
+fi
+
+# ---- checksums written by check --add -------------------------------------------
+if [ "$any_python" = yes ]; then
+    find "$work/dng" -name '*.dng' | sort >"$work/checksums.list"
+    : >"$work/checksums.log"
+    bad=0
+    while IFS= read -r file; do
+        if [ -n "$validator" ] && [ -x "$validator" ]; then
+            "$python" "$here/compare_checksums.py" --dngconv "$dngconv" --dng-validate "$validator" "$file" >>"$work/checksums.log" 2>&1 || bad=$((bad + 1))
+        else
+            "$python" "$here/compare_checksums.py" --dngconv "$dngconv" --dng-validate "" "$file" >>"$work/checksums.log" 2>&1 || bad=$((bad + 1))
+        fi
+    done <"$work/checksums.list"
+    same=$(grep -c "the same as the writer's" "$work/checksums.log")
+    if [ "$bad" -eq 0 ] && [ "$same" -eq "$converted" ]; then
+        if grep -q 'accepted by dng_validate' "$work/checksums.log"; then
+            passed checksums "$same DNGs: 'check --add' writes the checksums the converter wrote, and dng_validate accepts them"
+        else
+            passed checksums "$same DNGs: 'check --add' writes the checksums the converter wrote (no second opinion: dng_validate not found)"
+        fi
+    else
+        failed checksums "$same of $converted the same; see $work/checksums.log"
+    fi
+else
+    skipped checksums "Python not found"
 fi
 
 # ---- times --------------------------------------------------------------------

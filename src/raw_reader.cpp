@@ -8,16 +8,20 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <system_error>
+#include <utility>
 
 #include <libraw/libraw.h>
 
 #include "lens_data.hpp"
 #include "original_raw.hpp"
 #include "sidecar.hpp"
+#include "source_record.hpp"
 #include "source_metadata.hpp"
 
 #if !LIBRAW_COMPILE_CHECK_VERSION_NOTLESS(0, 21)
@@ -220,6 +224,24 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
     int rc = openFile(lr, path);
     if (rc != LIBRAW_SUCCESS)
         throw std::runtime_error(std::string("cannot open as raw: ") + libraw_strerror(rc));
+
+    // The source's checksum is taken on a thread of its own while the
+    // decoder works (when the whole file is kept anyway, from that copy).
+    const bool wantDigest = options.digestSource && !options.metadataOnly;
+    using SizedDigest = std::pair<Md5Digest, uint64_t>;
+    const auto digestSource = [path]() -> SizedDigest {
+        uint64_t size = 0;
+        const Md5Digest digest = digestOfFile(path, size);
+        return {digest, size};
+    };
+    std::future<SizedDigest> pendingDigest;
+    if (wantDigest && !options.keepOriginalFile) {
+        try {
+            pendingDigest = std::async(std::launch::async, digestSource);
+        } catch (const std::system_error&) {
+            // No thread to be had: it is taken at the end instead.
+        }
+    }
 
     const libraw_data_t& d = lr.imgdata;
     const auto& s = d.sizes;
@@ -560,6 +582,22 @@ RawReadResult readRaw(const std::filesystem::path& path, const RawReadOptions& o
     }
 
     if (options.keepOriginalFile && !options.metadataOnly) img.originalFile = readWholeFile(path);
+    if (wantDigest) {
+        try {
+            if (options.keepOriginalFile) {
+                img.sourceFileDigest = Md5::of(img.originalFile.data(), img.originalFile.size());
+                img.sourceFileSize = img.originalFile.size();
+            } else {
+                const SizedDigest taken = pendingDigest.valid() ? pendingDigest.get() : digestSource();
+                img.sourceFileDigest = taken.first;
+                img.sourceFileSize = taken.second;
+            }
+            img.hasSourceDigest = true;
+        } catch (const std::exception& e) {
+            warnings.push_back(std::string("the checksum of the source file could not be taken (") + e.what() +
+                               "); the DNG will not carry it");
+        }
+    }
 
     if (options.readSidecar) {
         const std::filesystem::path sidecar = findXmpSidecar(path);
