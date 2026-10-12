@@ -66,9 +66,12 @@ struct StoredRawImage {
 };
 
 /// Throws std::runtime_error if the file is not a DNG, is damaged, or stores
-/// its raw data in a form this program does not decode (lossy JPEG, JPEG XL,
-/// Deflate, floating point).
-StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned threads = 0);
+/// its raw data in a form this program does not decode (lossy JPEG,
+/// Deflate, floating point; JPEG XL without libjxl). Lossy JPEG XL is
+/// decoded only with `acceptLossy`: its values depend a little on the
+/// decoder, and are what it gives.
+StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned threads = 0,
+                                  bool acceptLossy = false);
 
 /// Throws std::runtime_error if the file cannot be opened or is not a DNG.
 /// Damage inside a DNG is reported in the result, not thrown.

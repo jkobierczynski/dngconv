@@ -30,6 +30,7 @@
 #include "dng_writer.hpp"
 #include "job_runner.hpp"
 #include "jxl_codec.hpp"
+#include "lossy_jxl.hpp"
 #include "original_raw.hpp"
 #include "raw_reader.hpp"
 #include "sidecar.hpp"
@@ -46,6 +47,8 @@ struct Settings {
     std::string output;
     DngCompression compression = DngCompression::LosslessJpeg;
     int jxlEffort = 3;
+    float jxlDistance = 0.0f;      // 0: lossless
+    bool compressionGiven = false;  // -c was on the command line
     DngPreview preview = DngPreview::Auto;
     uint32_t previewSize = 1024;  // longest edge of a rendered preview; 0 = largest
     bool makerNotes = true;
@@ -92,6 +95,11 @@ const char* const kUsage =
     "                            but needs a reader of DNG 1.7), or none\n"
     "      --jxl-effort <n>      how hard JPEG XL tries, 1 (fastest) to 9\n"
     "                            (smallest, much slower); default 3\n"
+    "      --jxl-distance <d>    store the raw data lossily, with JPEG XL (implies\n"
+    "                            -c jxl): 0 is lossless (default), 0.2 is Adobe's\n"
+    "                            choice, 1 about a fifth of the lossless size;\n"
+    "                            up to 25. Mosaic and monochrome sensors only;\n"
+    "                            other files are stored losslessly\n"
     "      --preview <which>     the JPEG preview in the DNG: auto (default; the\n"
     "                            camera's own, or one rendered from the raw data\n"
     "                            if the file has none), camera, render, or none\n"
@@ -312,6 +320,7 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
         } else if (a == "-c" || a == "--compression") {
             const std::string* v = needValue(i, a);
             if (!v) return false;
+            s.compressionGiven = true;
             if (*v == "lossless") {
                 s.compression = DngCompression::LosslessJpeg;
             } else if (*v == "none") {
@@ -323,6 +332,16 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
                              v->c_str());
                 return false;
             }
+        } else if (a == "--jxl-distance") {
+            const std::string* v = needValue(i, a);
+            if (!v) return false;
+            char* end = nullptr;
+            const float d = std::strtof(v->c_str(), &end);
+            if (v->empty() || !end || *end || !(d == 0.0f || (d >= 0.05f && d <= 25.0f))) {
+                std::fprintf(stderr, "dngconv: --jxl-distance needs 0 (lossless) or a number from 0.05 to 25\n");
+                return false;
+            }
+            s.jxlDistance = d;
         } else if (a == "--jxl-effort") {
             const std::string* v = needValue(i, a);
             if (!v) return false;
@@ -436,6 +455,13 @@ bool parseArguments(const std::vector<std::string>& args, Settings& s, int& exit
     if (s.inputs.empty()) {
         std::fputs(kUsage, stderr);
         return false;
+    }
+    if (s.jxlDistance > 0.0f) {
+        if (s.compressionGiven && s.compression != DngCompression::JpegXl) {
+            std::fprintf(stderr, "dngconv: --jxl-distance is for JPEG XL; it does not go with -c lossless or -c none\n");
+            return false;
+        }
+        s.compression = DngCompression::JpegXl;
     }
     return true;
 }
@@ -641,9 +667,26 @@ void printInfo(const fs::path& path, const RawReadResult& r, const Settings& set
     for (const auto& w : r.warnings) std::printf("  warning       %s\n", w.c_str());
 }
 
-// Reads the written DNG back and compares every sample with the source.
-void verifyOutput(const RawImage& source, const fs::path& dng, bool jxl, unsigned threads) {
-    if (jxl) {
+// Reads the written DNG back and compares every sample with the source; for
+// lossy data, compares what comes back with what was coded and judges
+// whether the difference is the coder's. Returns a note on that difference
+// for the report (empty for lossless data).
+std::string verifyOutput(const RawImage& source, const fs::path& dng, const DngWriteOptions& options,
+                         unsigned threads) {
+    const bool jxl = options.compression == DngCompression::JpegXl;
+    std::string note;
+    if (jxl && options.jxlDistance > 0.0f) {
+        if (checkDng(dng, threads).rawImage != DngCheck::State::Intact)
+            throw std::runtime_error("verification failed: the raw data does not match its checksum");
+        const StoredRawImage back = readStoredRawImage(dng, threads, true);
+        const LossyEncoding expected = encodeForLossyJxl(source, kLossyMaxTile, threads);
+        if (back.width != expected.width || back.height != expected.height || back.planes != 1)
+            throw std::runtime_error("verification failed: frame size differs after re-reading");
+        const LossyErrors errors = measureLossyErrors(expected, back.samples);
+        std::string why;
+        if (!lossyCloseEnough(errors, options.jxlDistance, why)) throw std::runtime_error("verification failed: " + why);
+        note = describe(errors);
+    } else if (jxl) {
         // The decoder library does not read JPEG XL; the reader of the check
         // command does, and the file's own checksum is tried as well.
         const StoredRawImage back = readStoredRawImage(dng, threads);
@@ -692,6 +735,7 @@ void verifyOutput(const RawImage& source, const fs::path& dng, bool jxl, unsigne
             throw std::runtime_error("verification failed: the embedded original differs from "
                                      "the source file");
     }
+    return note;
 }
 
 // Writes a file through a temporary one, so that an interrupted run leaves no
@@ -1168,6 +1212,7 @@ int main(int argc, char** argv) {
     DngWriteOptions writeOptions;
     writeOptions.compression = settings.compression;
     writeOptions.jxlEffort = settings.jxlEffort;
+    writeOptions.jxlDistance = settings.jxlDistance;
     writeOptions.threads = plan.perFile;
     writeOptions.preview = settings.preview;
     writeOptions.previewSize = settings.previewSize;
@@ -1295,7 +1340,15 @@ int main(int argc, char** argv) {
                                                  "lossless JPEG was used",
                                                  source.image.samplesPerPixel));
             }
+            // Lossy JPEG XL takes mosaics and single-channel images.
+            std::string whyNot;
+            if (options.compression == DngCompression::JpegXl && options.jxlDistance > 0.0f &&
+                !lossyJxlSupported(source.image, &whyNot)) {
+                options.jxlDistance = 0.0f;
+                source.warnings.push_back("lossy JPEG XL cannot store " + whyNot + "; stored losslessly");
+            }
             const bool jxl = options.compression == DngCompression::JpegXl;
+            const bool lossy = jxl && options.jxlDistance > 0.0f;
             const PreviewPlan previewPlan = planPreview(source.image, options);
             std::string previewNote;
             if (previewPlan.kind == PreviewPlan::Kind::Rendered)
@@ -1308,7 +1361,8 @@ int main(int argc, char** argv) {
             }
 
             writeDng(source.image, target, options);
-            if (settings.verify) verifyOutput(source.image, target, jxl, plan.perFile);
+            std::string verifyNote;
+            if (settings.verify) verifyNote = verifyOutput(source.image, target, options, plan.perFile);
             const LensOpcodes lens = makeLensOpcodes(source.image, settings.lensCorrections);
             for (const auto& note : lens.notes) source.warnings.push_back(note);
             if (settings.keepTimes && haveSourceTime) {
@@ -1324,18 +1378,23 @@ int main(int argc, char** argv) {
                 const auto inSize = fs::file_size(job.input, ec);
                 const auto outSize = fs::file_size(target, ec);
                 const bool sidecar = settings.sidecar && !source.image.xmpSidecarName.empty();
+                const std::string compressionNote =
+                    lossy ? format(", JPEG XL at distance %g", static_cast<double>(options.jxlDistance))
+                          : jxl ? std::string(", JPEG XL") : std::string();
+                std::string verified;
+                if (settings.verify)
+                    verified = lossy ? ", verified within coding error (" + verifyNote + ")"
+                                     : settings.embedOriginal ? ", pixels and embedded original verified" : ", verified";
+                if (lossy && settings.verify && settings.embedOriginal) verified += ", embedded original verified";
                 report.out = format("%s -> %s  (%s, %s -> %s, %.1f s%s%s%s%s%s%s%s%s%s)\n", name.c_str(),
                                     show(target).c_str(), source.image.uniqueCameraModel.c_str(),
                                     megabytes(inSize).c_str(), megabytes(outSize).c_str(), seconds,
-                                    updateNote.c_str(), jxl ? ", JPEG XL" : "",
+                                    updateNote.c_str(), compressionNote.c_str(),
                                     lens.any() ? ", lens: " : "", lens.summary().c_str(),
                                     profileNote.c_str(), previewNote.c_str(),
                                     sidecar ? ", with " : "",
                                     sidecar ? source.image.xmpSidecarName.c_str() : "",
-                                    settings.verify ? (settings.embedOriginal
-                                                           ? ", pixels and embedded original verified"
-                                                           : ", verified")
-                                                    : "");
+                                    verified.c_str());
             }
             outcomes[index] = Outcome::Converted;
         } catch (const std::exception& e) {

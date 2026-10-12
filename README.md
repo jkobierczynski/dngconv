@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib, and, if JPEG XL compression is wanted, libjxl.
 
-Status: **0.10.0, early**. It works on the cameras listed under
+Status: **0.11.0, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does
@@ -20,7 +20,9 @@ Status: **0.10.0, early**. It works on the cameras listed under
   all CPU cores, or uncompressed output.
 - Or **lossless JPEG XL** (`-c jxl`), the compression DNG 1.7 added: the
   same samples in files 14 % smaller on average, for programs that read
-  DNG 1.7. See [JPEG XL compression](#jpeg-xl-compression).
+  DNG 1.7. Or **lossy JPEG XL** (`--jxl-distance`), the way Adobe's SDK
+  does it: the raw data in a fifth of the space at distance 1, a mosaic
+  still to be developed as one. See [JPEG XL compression](#jpeg-xl-compression).
 - Bayer sensors, Fuji X-Trans, and full-colour raws such as Canon sRAW.
 - Colour: calibrated matrix (D65) and as-shot white balance, or the **camera
   profiles** you choose (`--profile`): DCP files such as Adobe Standard, the
@@ -115,6 +117,7 @@ dngconv --lens-corrections none *.ARW # leave the lens corrections out
 dngconv --profile ~/profiles *.CR3    # embed the camera profiles that fit
 dngconv --preview render --preview-size 2048 *.NEF   # previews made here
 dngconv -c jxl -o small/ *.ARW        # JPEG XL: smaller, for DNG 1.7 readers
+dngconv --jxl-distance 1 -o tiny/ *.ARW   # lossy JPEG XL: about a fifth of that
 dngconv -i shot.RAF                   # show what the decoder finds
 ```
 
@@ -125,6 +128,11 @@ dngconv -i shot.RAF                   # show what the decoder finds
                             but needs a reader of DNG 1.7), or none
       --jxl-effort <n>      how hard JPEG XL tries, 1 (fastest) to 9
                             (smallest, much slower); default 3
+      --jxl-distance <d>    store the raw data lossily, with JPEG XL (implies
+                            -c jxl): 0 is lossless (default), 0.2 is Adobe's
+                            choice, 1 about a fifth of the lossless size;
+                            up to 25. Mosaic and monochrome sensors only;
+                            other files are stored losslessly
       --preview <which>     the JPEG preview in the DNG: auto (default; the
                             camera's own, or one rendered from the raw data
                             if the file has none), camera, render, or none
@@ -411,7 +419,7 @@ been decoded first.
 
 ## What has been tested
 
-Each file below was converted and then checked in up to twelve ways:
+Each file below was converted and then checked in up to thirteen ways:
 
 1. **Bit-exact**: the DNG was decoded again and all samples compared with the
    source (`--verify`).
@@ -475,6 +483,11 @@ Each file below was converted and then checked in up to twelve ways:
     old dates, one was changed and one DNG made without its note; a run
     with `--update-by content` converted the changed file only and left
     the DNG without a note alone.
+
+13. **Lossy JPEG XL**: converted again at distances 0.2, 1 and 3; each
+    file judged by `--verify`, read by Adobe's SDK 1.7.1 without an error,
+    and its linear values as Adobe's reader computes them compared with
+    those of the lossless file. See [Lossy](#lossy).
 
 | Camera | Format | Sensor data | Source | DNG | DNG with `-c jxl` | Rendering difference |
 |---|---|---|---:|---:|---:|---|
@@ -773,6 +786,111 @@ libjxl: the checksum is of the compressed data, so nothing has to be
 decoded. `tools/compare_raw_data.py` repeats the second row for any pair of
 files, and `tools/dng-validate/build.sh --sdk 1.7` builds the validator.
 
+### Lossy
+
+`--jxl-distance` stores the raw data with lossy JPEG XL. The file is still
+a raw file, a mosaic that is demosaiced, white-balanced and developed by
+the reader like any other; what is given up is part of the precision of
+each sample. The distance is libjxl's measure of how much: larger is
+smaller and coarser.
+
+```sh
+dngconv --jxl-distance 1 -o ~/dng-small ~/photos        # about a fifth of lossless JPEG XL
+dngconv --jxl-distance 0.2 --verify -r -o ~/dng ~/photos  # what Adobe's SDK uses
+```
+
+Sizes of the raw data on the samples, against lossless JPEG XL (effort 3):
+
+| | lossless | 0.2 | 0.5 | 1 | 2 | 3 |
+|---|---:|---:|---:|---:|---:|---:|
+| Canon EOS R8 | 32.0 MB | 52 % | 39 % | 29 % | 19 % | 13 % |
+| Pentax K-1 II (stars) | 33.8 MB | 49 % | 29 % | 15 % | 4.5 % | 1.8 % |
+| Sony ILCE-7M3 | 20.2 MB | 47 % | 26 % | 11 % | 2.8 % | 1.3 % |
+| Fujifilm X-E1 (X-Trans) | 15.0 MB | 63 % | 43 % | 28 % | 16 % | 12 % |
+| Panasonic DMC-GF7 | 14.1 MB | 67 % | 46 % | 32 % | 21 % | 15 % |
+| Sony NEX-5N | 14.4 MB | 57 % | 37 % | 24 % | 14 % | 10 % |
+| all 14 mosaic samples together | 207 MB | 52 % | 33 % | 20 % | 10 % | 6.7 % |
+
+Pictures with much flat or dark area (the night sky of the Pentax file, a
+dark Sony scene) shrink most. On top of these, the DNG holds the preview,
+the thumbnail and the metadata, as always.
+
+**What it looks like.** Developed by Adobe's code and compared at 100 %
+with the lossless file: at 0.2 no difference can be seen (45 to 49 dB on
+four samples); at 0.5 hardly (37 to 42 dB); at 1 the grain of the noise is
+smoothed, detail stays (32 to 36 dB); at 2 smoothing shows, and faint
+detail goes, such as the fainter stars of the night sky; beyond 3 it is
+for previews of an archive, not for developing. The decibels understate
+the low distances, since much of what the coder removes is noise. For
+astronomy, and anything else that is to be stacked or pushed hard, keep
+the data lossless.
+
+**How it is stored.** As Adobe's SDK stores a lossy mosaic, with one
+difference:
+
+- The active area only. The values are made linear as a reader of the
+  lossless file would make them (black level off, scaled to the white
+  level), stretched over the range they use and put through a curve that
+  gives the shadows more of the codes (the inverse of
+  `y/16 + (15/16) y^3`); a lossy coder fed linear values starves the
+  shadows. The DNG carries the polynomial that undoes the curve as an
+  opcode (`MapPolynomial` in `OpcodeList2`), with `BlackLevel` 0 and
+  `WhiteLevel` 65535, so a reader arrives at the linear values again.
+- The difference: Adobe's SDK leaves the brightest and darkest
+  hundred-thousandth of the samples out of the range, which turns small
+  bright spots (stars, specular highlights) grey: in the Sony NEX-5N file
+  161 samples lose up to 56 % of their value that way, in a file Adobe's
+  SDK wrote. dngconv uses the whole range.
+- Each colour of the mosaic is a field of its own (the two interleave
+  factors), and the frame gets a margin, copied from its edge a period of
+  the pattern at a time, so that every field is a whole number of tiles:
+  no tile holds two colours, which a lossy coder would smear together.
+  Tiles of up to 768 pixels, coded as grey pictures with the sRGB transfer
+  curve as their label, as Adobe's are.
+- Defective pixels that the camera marks with 0 (Panasonic) are filled in
+  before coding, the way Adobe's reader fills them in a lossless file,
+  since coding would blur the marks.
+- `JXLDistance` and `JXLEffort` record the settings; the checksum is of the
+  compressed tiles, as for lossless JPEG XL.
+
+Bayer and X-Trans mosaics and monochrome sensors are stored this way;
+full-colour raws (Canon sRAW) are stored losslessly, with a note. The
+effort setting matters little here: 3 is as small as 7.
+
+**Verification: what "close enough" means.** A lossy file cannot be
+compared sample for sample. `--verify` reads it back with dngconv's reader,
+computes again what was given to the coder, and asks whether the
+difference is the coder's or something else's:
+
+- how far off the values are, overall (root mean square), tile by tile,
+  and as averages over blocks of 32 x 32 values of one colour; the limits
+  grow with the distance and lie at least twice above what the coder did
+  on any sample at any distance from 0.1 to 6;
+- whether the values are where they belong: for each colour field, the
+  values must be closer to their own expected values than to those one
+  pixel, or one period of the pattern, away. Coding blurs and adds noise
+  but leaves every value nearest its own place.
+
+The second test is the one that catches mistakes in the layout. On the 14
+samples, frames moved by one period, a colour field moved by one line, red
+and blue exchanged, and the two greens exchanged are all reported at every
+distance tried, from 0.2 to 10; a single misplaced tile is found at
+distances up to 1. The report says how close the file came:
+
+```
+IMG_0036.CR3 -> IMG_0036.dng  (Canon EOS R8, 35.9 MB -> 11.7 MB, 8.4 s, JPEG XL at distance 1, verified within coding error (rms 1.209 %, worst tile 1.251 %, 99.9 % within 4.08 %))
+```
+
+Independently of that, the files were read by Adobe's DNG SDK 1.7.1:
+
+| Check | Result |
+|---|---|
+| `dng_validate` on the lossy files of the 14 mosaic samples at distances 0.2, 1 and 3 | no error |
+| The linear values Adobe's reader gets from the lossy file (after its `MapPolynomial`), against those it gets from the lossless one | within the same limits at every distance, for all 14 (`tools/compare_lossy.py`) |
+| The values dngconv decodes and puts through the polynomial, against those Adobe's reader gets from the same file (five samples) | within 0.006 % of full scale everywhere |
+| Before coding, the linear values dngconv computes, against those Adobe's reader computes from the lossless file (five samples) | identical, to one 65535th, defective pixels included |
+| Files written with libjxl 0.7.0 and with 0.11.1, each judged with the other's decoder | within coding error, with the same figures |
+
 ## Previews
 
 A DNG carries ready-made pictures for programs that do not develop raw data:
@@ -932,7 +1050,11 @@ without ExifTool.
 storing the value 0. dngconv keeps those samples as they are and adds a DNG
 opcode (`FixBadPixelsConstant`) asking the reader to interpolate over them.
 Readers that implement opcodes repair them; readers that do not (LibRaw-based
-ones, for instance) show them as dark dots.
+ones, for instance) show them as dark dots. The opcode's `BayerPhase` says
+which pixels are green, and Adobe's SDK reads it the other way round from
+the specification's description; since 0.11 dngconv writes the value
+Adobe's reader acts on correctly (before, it filled red and blue defects
+from neighbours of the other colour). Other readers ignore the value.
 
 **Thumbnail.** The 256-pixel thumbnail is a quick rendering of the raw data,
 made like a rendered preview (see [Previews](#previews)): block averages
@@ -1008,7 +1130,7 @@ newer LibRaw.
   distribution packages are not.
 - A second calibration illuminant of dngconv's own (a profile given with
   `--profile` brings its own).
-- Lossy JPEG XL, and JPEG XL for the previews.
+- Lossy JPEG XL for full-colour raws, and JPEG XL for the previews.
 - Rendered previews at the sensor's full resolution (that needs
   demosaicing), or developed with an embedded camera profile.
 
@@ -1028,7 +1150,8 @@ newer LibRaw.
 | `src/camera_profile.*` | Reads camera profiles (`.dcp`), picks those that fit a camera, packs them for the DNG |
 | `src/render.*` | Renders an sRGB picture from the raw data, for the thumbnail and for previews |
 | `src/jpeg_encoder.*` | Baseline JPEG encoder for rendered previews |
-| `src/jxl_codec.*` | Lossless JPEG XL through libjxl, where the build has it |
+| `src/jxl_codec.*` | JPEG XL through libjxl, lossless and lossy, where the build has it |
+| `src/lossy_jxl.*` | Raw data prepared for lossy JPEG XL as Adobe's SDK prepares it, and the rule `--verify` judges lossy files by |
 | `src/ljpeg92.*`, `src/ljpeg92_decode.cpp` | Lossless JPEG encoder, and a decoder for checking files |
 | `src/md5.*` | MD5, for the DNG fingerprints |
 | `src/dng_digest.*` | The two raw image digests DNG defines |
@@ -1040,7 +1163,7 @@ newer LibRaw.
 | `src/sidecar.*` | Finds and reads XMP sidecar files |
 | `src/job_runner.hpp` | Runs jobs on several threads and keeps their reports in order |
 | `src/main.cpp` | Command line: conversion, `extract` and `check` |
-| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), JPEG XL (fields and compressed-data checksums on hand-built files; with libjxl the codec and the writer's files, without it the refusals), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), keeping an archive (the note of the source and its comparison with files that change, fields added to a file in place in both byte orders, checksums written into files stripped of them, refusals on damaged and read-only files), the program itself run on generated DNGs, DNG round trips on synthetic frames |
+| `tests/` | Lossless JPEG against a reference decoder, TIFF layout, the source-metadata parser on hand-built and damaged files, MD5, digests and thumbnail colours, rendered previews (the JPEG encoder against a decoder written for the tests, sizes, lens corrections, the choice between camera and rendered preview), embedded originals (layout, hand-built and damaged data, hostile file names), lens corrections (fit, opcode bytes, each maker's parser on hand-built and damaged files), the check (decoder against hand-built streams with every predictor, digests against independent values, verdicts on damaged files), JPEG XL (fields and compressed-data checksums on hand-built files; with libjxl the codec and the writer's files, without it the refusals), lossy JPEG XL (the curve and the opcode's bytes, linear values with black patterns and defect pixels, the stored frame and its margin, the verification rule against simulated layout faults), the job runner and sidecars, camera profiles (hand-built sound and broken files in both byte orders, the choice per camera, the tags and blocks in the DNG), keeping an archive (the note of the source and its comparison with files that change, fields added to a file in place in both byte orders, checksums written into files stripped of them, refusals on damaged and read-only files), the program itself run on generated DNGs, DNG round trips on synthetic frames |
 
 The reader and the writer only meet in `RawImage`, so either side can be
 replaced or reused on its own. The tests need no camera files.

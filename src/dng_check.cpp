@@ -202,7 +202,8 @@ inline uint32_t fieldStart(uint32_t f, uint32_t size, uint32_t factor) {
 
 // Reads the raw image of a DNG as stored. Throws std::runtime_error for
 // damage and Unsupported for forms this code does not decode.
-void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned threads, StoredRawImage& image) {
+void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned threads, StoredRawImage& image,
+                     bool acceptLossy = false) {
     const Layout l = readLayout(tiff, ifd);
     const uint32_t width = l.width, height = l.height, planes = l.planes;
     const unsigned bits = l.bits;
@@ -266,7 +267,7 @@ void readStoredImage(const Tiff& tiff, const std::vector<Entry>& ifd, unsigned t
                 damaged("a JPEG XL tile of the raw image has the wrong size");
             // Lossy data has no values of its own to compare: what comes out
             // depends on the decoder.
-            if (!picture.originalValues) throw Unsupported{"lossy JPEG XL compression"};
+            if (!picture.originalValues && !acceptLossy) throw Unsupported{"lossy JPEG XL compression"};
             decoded = std::move(picture.samples);
         } else {
             LosslessJpegFrame frame;
@@ -431,14 +432,14 @@ bool isDngFile(const std::filesystem::path& path) {
     }
 }
 
-StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned threads) {
+StoredRawImage readStoredRawImage(const std::filesystem::path& path, unsigned threads, bool acceptLossy) {
     Source src(path);
     Opened dng;
     openDng(src, dng);
     if (!dng.rawIfd) throw std::runtime_error("the file has no raw image directory");
     StoredRawImage image;
     try {
-        readStoredImage(dng.tiff, *dng.rawIfd, threads, image);
+        readStoredImage(dng.tiff, *dng.rawIfd, threads, image, acceptLossy);
     } catch (const Unsupported& u) {
         throw std::runtime_error("cannot decode: " + u.why);
     }

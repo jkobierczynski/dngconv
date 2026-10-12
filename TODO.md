@@ -4,7 +4,7 @@ Open work on dngconv, most useful first within each section. Tick an item
 when it is done and move the story of how it went to the history in
 `DEVELOPMENT.md`; this file only lists what is left.
 
-Last updated: 2026-10-12, at version 0.10.0.
+Last updated: 2026-10-12, at version 0.11.0.
 
 ## Needs someone with the software or an account
 
@@ -87,9 +87,13 @@ close the largest gaps in the verification.
 - [ ] **JPEG XL: what the first version left open.**
       - Open the files in Lightroom, Camera Raw or any other program that
         reads DNG 1.7, and say in the README which do.
-      - Lossy JPEG XL (`--jxl-distance`), on the mosaic as Adobe's SDK does
-        it. The checksum is of the compressed data already; `--verify`
-        would need a notion of "close enough".
+      - Lossy JPEG XL for full-colour raws (Canon sRAW and the like), as
+        three-channel pictures; they are stored losslessly now.
+      - Lossy files in Lightroom and Camera Raw: the look at distances 0.2
+        to 2, and whether those programs offer to make such files from
+        ours.
+      - A sharper verification for single tiles at large distances (a
+        tile upside down passes at 3 in two samples).
       - JPEG XL for the previews (smaller than JPEG at the same quality).
       - A bare codestream instead of the container when the sensor's depth
         allows declaring twelve bits.

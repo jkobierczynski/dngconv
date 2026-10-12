@@ -34,6 +34,9 @@
 #   jxl          dngconv -c jxl --verify,         (a dngconv with JPEG XL) samples read back; with
 #                compare_raw_data.py              dng_validate 1.7 and Python, Adobe's reader gets the
 #                                                 same raw data as from the lossless-JPEG DNG
+#   lossy        dngconv --jxl-distance --verify, (a dngconv with JPEG XL) every file within coding error;
+#                compare_lossy.py                 with dng_validate 1.7 and Python, Adobe's reader gets
+#                                                 the lossless values back within coding error too
 #   profiles     dngconv --profile, compare_profile.py   (Python; only with PROFILES set) every
 #                                                 embedded camera profile equals its .dcp file
 #
@@ -45,6 +48,7 @@
 #   DNG_VALIDATE  Adobe's validator (default: dng_validate on the PATH); build
 #                 it with tools/dng-validate/build.sh
 #   PYTHON        the Python to use (default: python3)
+#   LOSSY_DISTANCE  the distance for the lossy step (default 1)
 #   PROFILES      a folder of camera profiles (.dcp) to embed and compare;
 #                 without it the profiles step is skipped
 set -u
@@ -391,6 +395,45 @@ if "$dngconv" --version | grep -q 'JPEG XL: libjxl'; then
     fi
 else
     skipped jxl "this dngconv was built without libjxl"
+fi
+
+# ---- lossy JPEG XL ----------------------------------------------------------------
+distance=${LOSSY_DISTANCE:-1}
+if "$dngconv" --version | grep -q 'JPEG XL: libjxl'; then
+    "$dngconv" --jxl-distance "$distance" --verify -r -o "$work/lossy" "$raws" >"$work/lossy.log" 2>"$work/lossy.err"
+    written=$(grep -c ' -> ' "$work/lossy.log")
+    lossy=$(grep -c 'verified within coding error' "$work/lossy.log")
+    if grep -q 'verification failed' "$work/lossy.err" || [ "$written" -ne "$converted" ]; then
+        failed lossy "$written of $converted converted and judged; see $work/lossy.err"
+    elif ! "$dngconv" check -r -q "$work/lossy" >"$work/lossy.check" 2>&1; then
+        failed lossy "the check command does not find them intact; see $work/lossy.check"
+    else
+        version=$( { [ -n "$validator" ] && [ -x "$validator" ] && "$validator" 2>&1; } | sed -n 's/.*version \([0-9]*\)\.\([0-9]*\).*/\1\2/p' | head -n 1)
+        if [ -n "$version" ] && [ "$version" -ge 17 ] && [ "$have_python" = yes ] && [ -d "$work/jxl" ]; then
+            : >"$work/lossy.cmp"
+            good=0
+            bad=0
+            grep 'verified within coding error' "$work/lossy.log" >"$work/lossy.list" || true
+            while IFS= read -r line; do
+                rest=${line#* -> }
+                dng=${rest%%  (*}
+                if DNG_VALIDATE="$validator" "$python" "$here/compare_lossy.py" "$work/jxl${dng#"$work/lossy"}" "$dng" "$distance" >>"$work/lossy.cmp" 2>&1; then
+                    good=$((good + 1))
+                else
+                    bad=$((bad + 1))
+                fi
+            done <"$work/lossy.list"
+            if [ "$bad" -eq 0 ]; then
+                passed lossy "$lossy files at distance $distance within coding error by dngconv's judgement and, read by Adobe's reader, against the lossless files ($((written - lossy)) stored losslessly; see lossy.cmp)"
+            else
+                failed lossy "Adobe's reader gets more than coding error from $bad of $((good + bad)) files; see $work/lossy.cmp"
+            fi
+        else
+            passed lossy "$lossy files at distance $distance within coding error by dngconv's judgement ($((written - lossy)) stored losslessly; no second reader: that needs dng_validate 1.7, Python with opencv, and the jxl step)"
+        fi
+    fi
+else
+    skipped lossy "this dngconv was built without libjxl"
 fi
 
 # ---- camera profiles -------------------------------------------------------------

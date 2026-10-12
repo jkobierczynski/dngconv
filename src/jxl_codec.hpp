@@ -29,6 +29,16 @@ std::string jxlVersion();
 std::vector<uint8_t> encodeJxlLossless(const uint16_t* samples, uint32_t width, uint32_t height,
                                        uint32_t channels, int effort);
 
+/// Encodes `width` x `height` 16-bit samples of one channel lossily, at
+/// libjxl's `distance` (larger is smaller and coarser; 1 is about "visually
+/// lossless" for a picture shown as it is). The samples are declared to be
+/// grey with the sRGB transfer curve, so that the coder spends its bits
+/// evenly over the tones: values that are linear in light must be put
+/// through a curve first (see lossy_jxl.hpp). Throws std::runtime_error on
+/// failure or in a build without libjxl.
+std::vector<uint8_t> encodeJxlLossy(const uint16_t* samples, uint32_t width, uint32_t height, float distance,
+                                    int effort);
+
 struct JxlPicture {
     uint32_t width = 0;
     uint32_t height = 0;

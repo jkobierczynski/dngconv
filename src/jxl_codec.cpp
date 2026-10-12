@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <stdexcept>
 #include <utility>
 
@@ -47,22 +48,22 @@ std::string jxlVersion() {
 namespace {
 
 std::vector<uint8_t> encode(const uint16_t* samples, uint32_t width, uint32_t height, uint32_t channels,
-                            int effort);
+                            int effort, float distance = 0.0f);
 JxlPicture decode(const uint8_t* data, size_t size, size_t maxSamples);
 
 // libjxl builds tables of its own the first time they are needed. Tiles are
 // coded on several threads at once, each with its own encoder; so that no
 // two of them meet in that first use, the first call for a kind of picture
 // codes and decodes a small one alone, while the others wait.
-void prepare(uint32_t channels, int effort) {
+void prepare(uint32_t channels, int effort, bool lossy = false) {
     static std::mutex mutex;
-    static std::set<std::pair<uint32_t, int>> done;
+    static std::set<std::tuple<uint32_t, int, bool>> done;
     std::lock_guard<std::mutex> lock(mutex);
-    if (!done.insert({channels, effort}).second) return;
+    if (!done.insert({channels, effort, lossy}).second) return;
     constexpr uint32_t kSide = 96;
     std::vector<uint16_t> pixels(static_cast<size_t>(kSide) * kSide * channels);
     for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = static_cast<uint16_t>((i * 2654435761u) >> 17);
-    const std::vector<uint8_t> coded = encode(pixels.data(), kSide, kSide, channels, effort);
+    const std::vector<uint8_t> coded = encode(pixels.data(), kSide, kSide, channels, effort, lossy ? 1.0f : 0.0f);
     (void)decode(coded.data(), coded.size(), pixels.size());
 }
 
@@ -77,10 +78,21 @@ std::vector<uint8_t> encodeJxlLossless(const uint16_t* samples, uint32_t width, 
     return encode(samples, width, height, channels, effort);
 }
 
+std::vector<uint8_t> encodeJxlLossy(const uint16_t* samples, uint32_t width, uint32_t height, float distance,
+                                    int effort) {
+    if (!samples || width == 0 || height == 0)
+        throw std::invalid_argument("JPEG XL: picture must have a size");
+    if (!(distance > 0.0f) || distance > 25.0f) throw std::invalid_argument("JPEG XL: distance must be above 0, at most 25");
+    effort = std::clamp(effort, 1, 9);
+    prepare(1, effort, true);
+    return encode(samples, width, height, 1, effort, distance);
+}
+
 namespace {
 
 std::vector<uint8_t> encode(const uint16_t* samples, uint32_t width, uint32_t height, uint32_t channels,
-                            int effort) {
+                            int effort, float distance) {
+    const bool lossless = distance == 0.0f;
     Encoder enc;
     if (!enc.p) fail("the encoder could not be created");
 
@@ -93,22 +105,33 @@ std::vector<uint8_t> encode(const uint16_t* samples, uint32_t width, uint32_t he
     info.num_color_channels = channels;
     info.num_extra_channels = 0;
     info.alpha_bits = 0;
-    // Stored as given, not converted to the codec's own colour space: the
-    // condition for getting the same numbers back.
-    info.uses_original_profile = JXL_TRUE;
+    // Lossless: stored as given, not converted to the codec's own colour
+    // space, the condition for getting the same numbers back. Lossy: in the
+    // codec's own space (XYB), where its notion of visible error lives.
+    info.uses_original_profile = lossless ? JXL_TRUE : JXL_FALSE;
     if (JxlEncoderSetBasicInfo(enc.p, &info) != JXL_ENC_SUCCESS) fail("the encoder refused the picture's size");
 
-    // Sensor values are linear. The colour space is a label only; nothing is
-    // converted on the way in or out.
+    // Lossless: sensor values are linear, and the colour space is a label
+    // only; nothing is converted on the way in or out. Lossy: the values have
+    // been put through a curve that spaces the tones about evenly to the eye,
+    // which the sRGB transfer curve stands for here (Adobe's SDK does the
+    // same); the decoder hands the values back in that encoding.
     JxlColorEncoding colour;
-    JxlColorEncodingSetToLinearSRGB(&colour, channels == 1 ? JXL_TRUE : JXL_FALSE);
+    if (lossless)
+        JxlColorEncodingSetToLinearSRGB(&colour, channels == 1 ? JXL_TRUE : JXL_FALSE);
+    else
+        JxlColorEncodingSetToSRGB(&colour, channels == 1 ? JXL_TRUE : JXL_FALSE);
     if (JxlEncoderSetColorEncoding(enc.p, &colour) != JXL_ENC_SUCCESS) fail("the encoder refused the colour encoding");
 
     JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(enc.p, nullptr);
     if (!frame) fail("the encoder gave no frame settings");
-    if (JxlEncoderSetFrameDistance(frame, 0.0f) != JXL_ENC_SUCCESS ||
-        JxlEncoderSetFrameLossless(frame, JXL_TRUE) != JXL_ENC_SUCCESS)
-        fail("lossless mode is not available");
+    if (lossless) {
+        if (JxlEncoderSetFrameDistance(frame, 0.0f) != JXL_ENC_SUCCESS ||
+            JxlEncoderSetFrameLossless(frame, JXL_TRUE) != JXL_ENC_SUCCESS)
+            fail("lossless mode is not available");
+    } else if (JxlEncoderSetFrameDistance(frame, distance) != JXL_ENC_SUCCESS) {
+        fail("the encoder refused the distance");
+    }
     if (JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT, std::clamp(effort, 1, 9)) !=
         JXL_ENC_SUCCESS)
         fail("the encoder refused the effort setting");
@@ -191,6 +214,7 @@ JxlPicture decodeJxl(const uint8_t* data, size_t size, size_t maxSamples) {
     // Decoding in several threads is preceded by the same first use; a file
     // being read was not necessarily written by this run.
     prepare(1, 3);
+    prepare(1, 3, true);
     return decode(data, size, maxSamples);
 }
 
@@ -201,6 +225,10 @@ bool jxlAvailable() { return false; }
 std::string jxlVersion() { return {}; }
 
 std::vector<uint8_t> encodeJxlLossless(const uint16_t*, uint32_t, uint32_t, uint32_t, int) {
+    throw std::runtime_error("this build of dngconv has no JPEG XL support (it was built without libjxl)");
+}
+
+std::vector<uint8_t> encodeJxlLossy(const uint16_t*, uint32_t, uint32_t, float, int) {
     throw std::runtime_error("this build of dngconv has no JPEG XL support (it was built without libjxl)");
 }
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.10.0 LANGUAGES CXX
+project(dngconv VERSION 0.11.0 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -229,6 +229,7 @@ add_library(dngconv_core STATIC
   src/dng_writer.cpp
   src/lens_data.cpp
   src/lens_opcodes.cpp
+  src/lossy_jxl.cpp
   src/jpeg_encoder.cpp
   src/jxl_codec.cpp
   src/ljpeg92.cpp
@@ -301,6 +302,10 @@ if(DNGCONV_BUILD_TESTS)
   add_executable(test_archive tests/test_archive.cpp)
   target_link_libraries(test_archive PRIVATE dngconv_core dngconv_warnings)
   add_test(NAME archive COMMAND test_archive ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(test_lossy tests/test_lossy.cpp)
+  target_link_libraries(test_lossy PRIVATE dngconv_core dngconv_warnings)
+  add_test(NAME lossy COMMAND test_lossy ${CMAKE_CURRENT_BINARY_DIR})
 
   add_executable(test_jxl tests/test_jxl.cpp)
   target_link_libraries(test_jxl PRIVATE dngconv_core dngconv_warnings)

@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-12, at version 0.10.0.
+Last updated: 2026-10-12, at version 0.11.0.
 
 ## Status at a glance
 
@@ -14,6 +14,7 @@ Last updated: 2026-10-12, at version 0.10.0.
 | Raw decoding (through LibRaw) | Working: Bayer, X-Trans, full-colour raws |
 | DNG writing (own TIFF writer, lossless JPEG) | Working, both byte orders |
 | JPEG XL compression (`-c jxl`, DNG 1.7, through libjxl) | Working, lossless; Adobe's SDK 1.7.1 reads the same raw data from all 15 samples, and dngconv reads Adobe's files |
+| Lossy JPEG XL (`--jxl-distance`) | Working for mosaics and monochrome sensors; Adobe's SDK 1.7.1 arrives at the linear values within coding error on all 14 mosaic samples; `--verify` judges by a rule calibrated on them |
 | Pixel fidelity | Bit-exact on all 15 sample files |
 | Colour (matrix, white balance, levels) | Working, one illuminant (D65) |
 | Camera profiles (`--profile`) | Working: DCP files embedded as main and extra profiles; identical renders to an ExifTool-made reference in Adobe's code |
@@ -535,6 +536,67 @@ Decisions:
 - **Sixteen bits declared for every tile**, whatever the sensor's depth, as
   Adobe does. Declaring twelve would save the container, and little else.
 
+### 0.11.0 (2026-10-12): lossy JPEG XL
+
+1. **`--jxl-distance <d>`** (implies `-c jxl`): the raw data stored with
+   lossy JPEG XL, prepared the way Adobe's SDK prepares a mosaic for it
+   (read from `dng_negative.cpp`, `LossyCompressMosaicJXL` and
+   `EncodeImageForCompression`): active area only, made linear, stretched
+   over its range, put through the curve whose inverse is
+   `y/16 + (15/16) y^3`; `MapPolynomial` in `OpcodeList2` to undo it;
+   colour fields of whole tiles, with a margin repeated from the edge;
+   tiles labelled grey with the sRGB transfer curve (`lossy_jxl.*`).
+2. **`--verify` for lossy data**: what comes back is compared with what was
+   coded, by a rule with five parts (see the findings), and the report says
+   how close it came.
+3. **The reader behind `check`** decodes lossy JPEG XL when asked to
+   (`readStoredRawImage(..., acceptLossy)`); `check` itself still judges
+   such files by their checksum only.
+4. **Defect pixels: the BayerPhase is now written as Adobe's reader takes
+   it** (see the findings). This changes lossless files too.
+5. `tools/compare_lossy.py`; step `lossy` in `verify.sh` (17 steps); a
+   fifteenth test program, `test_lossy`.
+
+Findings:
+
+| Finding | Resolution |
+|---|---|
+| Adobe's SDK stores only a 2 x 2 mosaic lossily, and not as it is: the active area, linearised, put through a curve with an opcode to undo it, padded so that each colour field is a whole number of tiles. Its comment: without the curve "JPEG XL [would] overly compress in the shadows". | Followed, including the curve and its constants, so that a lossy file of ours is read exactly as one of Adobe's. X-Trans (6 x 6 fields) and monochrome sensors are stored the same way; Adobe's reader reads them (X-Trans tried). Full-colour raws are left lossless. |
+| The SDK leaves the brightest and darkest hundred-thousandth of the samples out of the range the curve spans. In the file the SDK wrote from the Sony NEX-5N sample, 161 samples lose up to 56 % of their value: the brightest specks, highlights that had clipped, become grey. A star field would lose its stars' cores. | The whole range is used. |
+| The first linear values did not match Adobe's reading of the lossless file of the damaged Canon 400D sample, by up to 14 %: its black levels differ widely between the four positions of the pattern (257 to 9146), and Adobe's reader scales every position by white minus the highest black, not by white minus its own. | Same scaling. Since then the linear values equal those of Adobe's reader for every sample, to one 65535th. |
+| Defect pixels (Panasonic, marked 0): Adobe's reader filled 50 of them differently from dngconv, by up to 47 %. Its `FixBadPixelsConstant` takes a pixel for green when row + column + p + p/2 is even, p the BayerPhase: green at the origin for p = 0 and 3, the opposite of the specification's description (0 red, 1 and 2 green, 3 blue), which dngconv had followed. So Adobe's reader filled red and blue defects from their diagonal neighbours, of the other colour. | Lossless files: the phase is written as Adobe's reader takes it (the specification's value with its lowest bit flipped); rawspeed ignores it, LibRaw ignores the opcode. Lossy files: the defects are filled before coding, exactly as Adobe's reader fills them (diagonals for green, two pixels away for red and blue, defective neighbours left out, its rounding). After that, Adobe's reading of the lossless Panasonic file and dngconv's filled values agree everywhere. |
+| What is "close enough"? Measured on the 14 mosaic samples at distances 0.1 to 6, in the coded domain: root mean square up to 1.23 x distance %, worst tile 1.26 x, worst 32 x 32 block average 0.32 x, overall mean 0.05 x. | Limits 2.5, 3, 1 (+ 0.1 %) and 0.1 (+ 0.01 %) x distance: at least twice what was seen. |
+| Those four measures do not catch subtle layout mistakes once the distance reaches 1: a frame moved by one period, a field moved by one line, the two greens exchanged, red and blue exchanged at 3. Their errors are the size of the coder's. | A fifth test: every colour field must fit its own expected values better than those one pixel, or one period, away in any direction. Coding blurs but does not move. The margins of sound files stay positive up to distance 25 (smallest 0.004), and every one of those faults is caught on every sample at 0.2, 1, 3 and 10. A single tile in the wrong place or upside down is caught up to distance 1, and in 12 of 14 samples at 3. |
+| Effort for lossy coding hardly matters: Sony NEX-5N and Panasonic at distance 1, effort 1, 3, 5, 7: 3.84/3.49/3.68/3.69 and 4.86/4.50/4.49/4.54 MB. | Default stays 3 (Adobe uses 7). |
+| libjxl 0.11.1 writes files 3 to 4 % smaller than 0.7.0 at the same distance. | Noted. Each version's decoder judges the other's files within coding error, with the same figures to three decimals. |
+
+How it was verified:
+
+| Check | Result |
+|---|---|
+| `dng_validate` 1.7.1 on the lossy DNGs of the 14 mosaic samples at distances 0.2, 1 and 3 | no error |
+| `compare_lossy.py`: stage 2 (linearised, opcodes applied) of each lossy file against that of the lossless JPEG XL file, both read by Adobe's SDK | within the rule's limits for all 14 at the three distances |
+| dngconv's decoding plus the polynomial, against Adobe's stage 2 of the same lossy file (five samples) | within 0.006 % of full scale (largest difference over the whole frame) |
+| Adobe's rendering of lossy against lossless files, four samples | 45 to 49 dB at 0.2, 37 to 42 at 0.5, 32 to 36 at 1, 29 to 33 at 2; 100 % crops looked at: noise smoothed from 1, faint stars gone at 2 |
+| The fault simulation above | all layout faults caught |
+| Sanitizers | ASan and UBSan: tests, and five conversions with `--verify -e` at distance 0.5, clean. TSan: the 16 samples at distance 2, four files at once, `--verify`, no report |
+| All builds | 15 of 15 tests with LibRaw 0.21.2 and 0.22.0, GCC 13 and Clang 18, libjxl 0.7.0, 0.11.1 and none |
+
+Decisions:
+
+- **Lossy is opt-in and says so in the report.** The converter's default
+  remains that nothing is lost.
+- **Adobe's preparation, not one of our own.** Readers of DNG 1.7 are
+  Adobe's code and code that follows it; a file prepared the same way is
+  read the same way. The one deviation, the full range, cannot make a
+  reader go wrong: it changes only the polynomial's coefficients.
+- **Masked borders are dropped** in lossy files, as Adobe does: their
+  values mean nothing once the black level is subtracted.
+- **`check` does not decode lossy data**: the checksum of the compressed
+  tiles says whether the file is as written, which is the question
+  `check` answers. Decoding is what `--verify` does, once, when the file is
+  made.
+
 ### 0.10.0 (2026-10-12): the archive side
 
 1. **`check --add`** (`-a`): writes the checksums into DNGs that have none.
@@ -743,7 +805,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 
 | Check | Tool | What it proves |
 |---|---|---|
-| Unit tests (14 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, checksums added to files in place and the note of a DNG's source, the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
+| Unit tests (15 programs) | CTest, on Linux locally and on macOS and Windows through the GitHub workflows | Encoder against a reference decoder, TIFF layout byte by byte, source parser on hand-built and damaged files, MD5, digests and thumbnail colours, embedded originals, lens corrections, the check with its decoder, the job runner, sidecars, checksums added to files in place and the note of a DNG's source, lossy JPEG XL (curve, opcode bytes, linear values, layout, the verification rule against simulated faults), the program itself on generated DNGs, DNG round trips through LibRaw in both byte orders |
 | `--verify` on every sample | LibRaw 0.21.2 and 0.22.0 | Every sample of the frame survives |
 | Render comparison | rawpy (LibRaw 0.22.1) | Source and DNG develop to the same 8-bit picture, so levels, matrix, white balance and pattern agree |
 | Reference reader | Adobe `dng_validate`, DNG SDK 1.5.1 | Adobe's own code decodes the raw data, recomputes the image digest, reads the previews and both maker-note copies. No errors; three warnings about values the cameras wrote |
@@ -756,6 +818,7 @@ readable with the distribution's LibRaw (Sigma X3F).
 | Lens corrections, colour fringes and brightness | Phase correlation between the sensor's colour planes; noise statistics; brightness of the camera JPEG against the render | The sign and size of the aberration parameters; that Sony's vignetting gain is already in the data |
 | The `check` command | LibRaw, Adobe `dng_validate` (as reader and as writer), camera-written DNGs | See the 0.5.1 history: the decoder, both digests and the verdicts agree with independent code |
 | Checksums written into existing files (`check --add`) | Adobe's code as the writer of 25 files whose checksums are reproduced; `dng_validate` 1.5.1 and 1.7.1, ExifTool, exiv2, LibRaw and darktable as readers of six camera files before and after | The arithmetic is Adobe's for every kind of raw data dngconv reads, and a file is the same file afterwards; see the 0.10.0 history |
+| Lossy JPEG XL | Adobe `dng_validate` 1.7.1 as reader (stage 2 against the lossless file's), libjxl 0.7.0 and 0.11.1 each decoding the other's files, simulated layout faults | The opcode and levels written make Adobe's reader arrive at the original linear values within coding error, and `--verify` tells coding error from misplaced data; see the 0.11.0 history |
 | JPEG XL | Adobe `dng_validate` 1.7.1 as reader (stage 1 image compared) and as writer; libjxl 0.7.0 and 0.11.1 | The reference reader gets the same raw data from a JPEG XL DNG as from the lossless-JPEG one, and dngconv reads Adobe's files; see the 0.9.0 history |
 | Rendered previews | libjpeg (Pillow, OpenCV), OpenCV SIFT matching against the camera's JPEG | The encoder writes what libjpeg would; the rendered picture has the camera's geometry and, within the spread between cameras, its tones; see the 0.8.0 history |
 | Camera profiles | ExifTool (tag values, and as the writer of a reference DNG), Adobe `dng_validate` (parsing, rendering, rewriting) | The embedded profile is the `.dcp` file's, and is developed as such; see the 0.7.0 history |

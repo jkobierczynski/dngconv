@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "dng_writer.hpp"
 
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -15,6 +16,7 @@
 
 #include "dng_digest.hpp"
 #include "lens_opcodes.hpp"
+#include "lossy_jxl.hpp"
 #include "ljpeg92.hpp"
 #include "md5.hpp"
 #include "original_raw.hpp"
@@ -92,6 +94,7 @@ constexpr uint16_t RowInterleaveFactor = 50975;
 constexpr uint16_t ColumnInterleaveFactor = 52547;
 constexpr uint16_t JXLDistance = 52553;
 constexpr uint16_t JXLEffort = 52554;
+constexpr uint16_t OpcodeList2 = 51009;
 constexpr uint16_t PreviewApplicationName = 50966;
 constexpr uint16_t PreviewApplicationVersion = 50967;
 constexpr uint16_t PreviewColorSpace = 50970;
@@ -364,6 +367,19 @@ int bayerPhase(const RawImage& img) {
     return -1;
 }
 
+// The BayerPhase to write for a frame whose origin has the phase `phase` as
+// the specification numbers it (0 red, 1 green on a red row, 2 green on a
+// blue row, 3 blue). Adobe's SDK, the one reader known to use the value,
+// takes a pixel for green when row + column + p + p/2 is even, which is
+// green at the origin for p = 0 and 3: the opposite of the specification.
+// Its reader then fills a red or blue defect from the four diagonal
+// neighbours, which are of the other colour (found on a Panasonic file:
+// 50 pixels, up to 47 % off). What counts is that the reader fills each
+// defect from its own colour, so the value is written the way the SDK reads
+// it; any value is the same to the spec's other readers, which ignore it
+// (rawspeed) or the opcode (LibRaw).
+uint32_t adobeBayerPhase(int phase) { return static_cast<uint32_t>(phase ^ 1); }
+
 // An opcode list holding a single FixBadPixelsConstant instruction: "every
 // sample equal to `constant` is a defective pixel; interpolate over it".
 // Opcode lists are big-endian whatever the byte order of the file.
@@ -516,6 +532,13 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         throw std::invalid_argument("JPEG XL compression needs one or three samples per pixel");
     if (jxl && !jxlAvailable())
         throw std::runtime_error("this build of dngconv has no JPEG XL support (it was built without libjxl)");
+    const bool lossy = jxl && options.jxlDistance != 0.0f;
+    if (lossy) {
+        if (!(options.jxlDistance > 0.0f) || options.jxlDistance > 25.0f)
+            throw std::invalid_argument("JPEG XL distance must be above 0 and at most 25");
+        std::string why;
+        if (!lossyJxlSupported(img, &why)) throw std::invalid_argument("lossy JPEG XL cannot store " + why);
+    }
 
     const MakerNote& note = img.source.makerNote;
     const bool withMakerNote = options.makerNotes && note.data.size() > 4 &&
@@ -584,7 +607,32 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
 
     Md5Digest jxlDigest{};
     bool columnsInterleaved = false;
-    if (jxl) {
+    LossyEncoding lossyEncoding;
+    if (lossy) {
+        // The active area, made linear and put through a curve, with a margin
+        // that makes each colour field a whole number of tiles.
+        lossyEncoding = encodeForLossyJxl(img, kLossyMaxTile, options.threads);
+        const LossyEncoding& e = lossyEncoding;
+        const int effort = std::clamp(options.jxlEffort, 1, 9);
+        std::vector<std::vector<uint8_t>> tiles = compressLossyTiles(e, options.jxlDistance, effort, options.threads);
+        if (options.digests) jxlDigest = compressedTilesDigest(tiles, options.threads);
+        raw.setLong(tag::ImageWidth, e.width);
+        raw.setLong(tag::ImageLength, e.height);
+        raw.setShort(tag::Compression, kCompressionJxl);
+        raw.setLong(tag::TileWidth, e.tileWidth);
+        raw.setLong(tag::TileLength, e.tileHeight);
+        raw.setChunks(tag::TileOffsets, tag::TileByteCounts, std::move(tiles));
+        if (e.rowFactor > 1) raw.setShort(tag::RowInterleaveFactor, static_cast<uint16_t>(e.rowFactor));
+        if (e.columnFactor > 1) raw.setShort(tag::ColumnInterleaveFactor, static_cast<uint16_t>(e.columnFactor));
+        columnsInterleaved = e.columnFactor > 1;
+        float distance = options.jxlDistance;
+        uint32_t bits;
+        std::memcpy(&bits, &distance, sizeof bits);
+        raw.setRaw(tag::JXLDistance, 11, 1,
+                   {static_cast<uint8_t>(bits), static_cast<uint8_t>(bits >> 8), static_cast<uint8_t>(bits >> 16),
+                    static_cast<uint8_t>(bits >> 24)});
+        raw.setLong(tag::JXLEffort, static_cast<uint32_t>(effort));
+    } else if (jxl) {
         const JxlLayout layout = chooseJxlLayout(img, options.tileSize);
         const int effort = std::clamp(options.jxlEffort, 1, 9);
         std::vector<std::vector<uint8_t>> tiles = compressJxlTiles(img, layout, effort, options.threads);
@@ -627,6 +675,13 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         raw.setShort(tag::CFALayout, 1);  // rectangular
     }
 
+    if (lossy) {
+        // Stored values are linear's curve-coded form: black 0, white the
+        // top of the 16-bit range; the opcode makes them linear again.
+        raw.setShorts(tag::BlackLevelRepeatDim, {1, 1});
+        raw.setLongs(tag::BlackLevel, {0});
+        raw.setLongs(tag::WhiteLevel, {65535});
+    } else {
     raw.setShorts(tag::BlackLevelRepeatDim, {static_cast<uint16_t>(img.blackRows),
                                              static_cast<uint16_t>(img.blackCols)});
     if (allIntegers(img.blackLevel)) {
@@ -648,18 +703,27 @@ void writeDng(const RawImage& img, std::ostream& out, const DngWriteOptions& opt
         }
         raw.setLongs(tag::WhiteLevel, white);
     }
+    }
     raw.setRationals(tag::DefaultScale, {img.scaleH, img.scaleV});
     raw.setLongs(tag::DefaultCropOrigin, {img.cropLeft, img.cropTop});
     raw.setLongs(tag::DefaultCropSize, {img.cropWidth, img.cropHeight});
-    raw.setLongs(tag::ActiveArea,
-                 {img.activeTop, img.activeLeft, img.activeBottom, img.activeRight});
+    if (lossy)
+        raw.setLongs(tag::ActiveArea, {lossyEncoding.padTop, lossyEncoding.padLeft,
+                                       lossyEncoding.padTop + lossyEncoding.activeHeight,
+                                       lossyEncoding.padLeft + lossyEncoding.activeWidth});
+    else
+        raw.setLongs(tag::ActiveArea,
+                     {img.activeTop, img.activeLeft, img.activeBottom, img.activeRight});
 
     std::vector<uint8_t> opcodeList1;
     if (img.zeroIsBadPixel) {
         const int phase = bayerPhase(img);
-        if (phase >= 0) opcodeList1 = fixBadPixelsConstantOpcode(0, static_cast<uint32_t>(phase));
+        if (phase >= 0) opcodeList1 = fixBadPixelsConstantOpcode(0, adobeBayerPhase(phase));
     }
-    if (!opcodeList1.empty()) raw.setUndefined(tag::OpcodeList1, opcodeList1);
+    // Lossy data has its defective pixels filled in already: coding would
+    // have blurred the zeros the opcode looks for.
+    if (!opcodeList1.empty() && !lossy) raw.setUndefined(tag::OpcodeList1, opcodeList1);
+    if (lossy) raw.setUndefined(tag::OpcodeList2, lossyEncoding.opcodeList2());
 
     // The camera's lens corrections, for the reader to apply after demosaicing.
     const std::vector<uint8_t>& opcodeList3 = lensOpcodes.opcodeList3;

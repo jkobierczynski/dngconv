@@ -265,6 +265,13 @@ int main(int argc, char** argv) {
         CHECK(r.status == 2);
         r = run("-c none --jxl-effort 9 " + missing);
         CHECK(r.status == 1 && contains(r.err, "no such file"));
+        // Lossy JPEG XL: a distance of 0 (lossless) or 0.05 to 25; it means
+        // JPEG XL, and does not go with another compression.
+        for (const char* bad : {"--jxl-distance -1", "--jxl-distance 0.01", "--jxl-distance 26", "--jxl-distance much",
+                                "--jxl-distance", "-c lossless --jxl-distance 1", "--jxl-distance 2 -c none"})
+            CHECK(run(std::string(bad) + " " + missing).status == 2);
+        r = run("-c lossless --jxl-distance 1 " + missing);
+        CHECK(contains(r.err, "--jxl-distance is for JPEG XL"));
         // The version report says whether JPEG XL is in the build, and asking
         // for it without is refused before any file is touched.
         r = run("--version");
@@ -273,6 +280,14 @@ int main(int argc, char** argv) {
         r = run("-c jxl " + missing);
         CHECK(r.status == 1);
         CHECK(contains(r.err, withJxl ? "no such file" : "no JPEG XL support"));
+        for (const char* fine : {"--jxl-distance 1", "--jxl-distance 0.05", "--jxl-distance 25", "-c jxl --jxl-distance 0.2",
+                                 "--jxl-distance 0"}) {
+            r = run(std::string(fine) + " " + missing);
+            CHECK(r.status == 1);
+            CHECK(contains(r.err, withJxl || std::string(fine) == "--jxl-distance 0" ? "no such file" : "no JPEG XL support"));
+        }
+        r = run("--help");
+        CHECK(contains(r.out, "--jxl-distance"));
         // A DNG given for conversion is named as what it is.
         r = run("-o " + quoted(gDir / "again.dng") + " " + quoted(gDir / "in" / "shot00.dng"));
         CHECK(r.status == 1 && contains(r.err, "already a DNG"));

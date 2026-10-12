@@ -53,6 +53,10 @@ struct DngWriteOptions {
     uint32_t tileSize = 512;
     /// libjxl's effort for JPEG XL, 1 (fastest) to 9 (smallest).
     int jxlEffort = 3;
+    /// JPEG XL distance: 0 for lossless; above 0 (up to 25) the raw data is
+    /// stored lossily, prepared as described in lossy_jxl.hpp. Needs an
+    /// image lossyJxlSupported() accepts.
+    float jxlDistance = 0.0f;
     /// Worker threads for compression; 0 = one per CPU core.
     unsigned threads = 0;
     /// Render a small RGB thumbnail from the raw data and store it in the

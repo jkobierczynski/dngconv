@@ -32,6 +32,7 @@ there is a tool for:
   ok       lens      4 files with a distortion opcode match their camera JPEG (see lens.log)
   ok       preview   12 rendered previews have the geometry of their camera JPEG; 3 more decode ...
   ok       jxl       15 files read back by dngconv; Adobe's reader gets the same raw data from all 15 ...
+  ok       lossy     14 files at distance 1 within coding error by dngconv's judgement and, read by Adobe's ...
   ok       profiles  9 DNGs carry the profiles made for their camera, value for value (...)
 
 all steps that ran passed
@@ -59,9 +60,10 @@ is 0 if no step that ran failed.
 | lens | The DNG, developed with its lens opcodes, has the geometry of the camera's own JPEG | `dng_validate`, ExifTool, Python, OpenCV |
 | preview | Converted again with `--preview render`, every preview decodes as a JPEG and, where the raw file holds a camera JPEG, has its geometry | ExifTool, Python, OpenCV |
 | jxl | Converted again with `-c jxl`, every sample is read back, and Adobe's reader gets the same raw data out of each file as out of its lossless-JPEG twin. Runs only if dngconv was built with libjxl; the second half needs the 1.7 validator | dngconv with libjxl; `dng_validate` 1.7, Python, OpenCV |
+| lossy | Converted again with `--jxl-distance` (1, or `LOSSY_DISTANCE`), every file passes `--verify`'s rule and `check`; with the 1.7 validator, Adobe's reader arrives at the lossless file's linear values within the same limits | dngconv with libjxl; `dng_validate` 1.7, Python, OpenCV |
 | profiles | Converted again with `--profile`, each DNG holds the profiles of its camera exactly as the `.dcp` files have them, and Adobe's reader parses them. Runs only when `PROFILES` names a folder of profiles | Python; `dng_validate` if present |
 
-Environment variables: `DNGCONV` (the program under test; default
+Environment variables: `LOSSY_DISTANCE` (for the lossy step, default 1), `DNGCONV` (the program under test; default
 `build/dngconv`), `DNG_VALIDATE`, `PYTHON`, and `PROFILES` (a folder of
 camera profiles for the last step; RawTherapee's `rtdata/dcpprofiles` is a
 freely available one).
@@ -167,6 +169,15 @@ given its checksums, and `dng_validate` (`--dng-validate`, or the
 `DNG_VALIDATE` variable) is asked whether it accepts them. The files named
 are never written to. Options: `--dngconv PATH` (default: the `DNGCONV`
 variable, or the PATH).
+
+**`compare_lossy.py LOSSLESS_DNG LOSSY_DNG DISTANCE`** reads both files
+with Adobe's validator, which writes the raw image after linearisation and
+`OpcodeList2` (where the lossy file's polynomial undoes its curve), and
+compares the two: in the coded domain by the limits `--verify` uses (root
+mean square, averages of 32 x 32 blocks of one colour), in linear light by
+report only. It checks what dngconv's own verification cannot: that the
+opcode and levels written make Adobe's reader arrive at the original
+values.
 
 **`compare_preview.py RAW_FILE DNG_FILE`** is for DNGs converted with
 `--preview render`. It takes the preview out of the DNG, decodes it, and

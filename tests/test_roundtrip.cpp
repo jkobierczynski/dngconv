@@ -425,11 +425,13 @@ int main(int argc, char** argv) {
         CHECK(rawIfd.at(322).u32() == 512 && rawIfd.at(323).u32() == 512);
         CHECK(rawIfd.at(324).count == 6 && rawIfd.at(325).count == 6);
         // Defect-pixel opcode. The active area starts at an even row and an
-        // even column, so the frame origin has the same phase: red = 0.
+        // even column, so the frame origin has the same phase: red, 0 in the
+        // specification's numbering, written as 1, the value with which
+        // Adobe's reader takes the origin for a pixel that is not green.
         CHECK(rawIfd.at(51008).type == 7);
         CHECK(rawIfd.at(51008).data ==
               std::vector<uint8_t>({0, 0, 0, 1, 0, 0, 0, 4, 1, 3, 0, 0, 0, 0, 0, 1,
-                                    0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0}));
+                                    0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 1}));
         CHECK(rawIfd.count(50706) == 0 && rawIfd.count(51111) == 0);  // camera tags stay in IFD0
 
         // EXIF sub-directory.
@@ -469,14 +471,15 @@ int main(int argc, char** argv) {
         CHECK(recropped0.at(51111).data == digest && recropped0.at(50781).data != uniqueId);
 
         // Active area starting on an odd column shifts the phase: the frame
-        // origin is then a green pixel on a red row.
+        // origin is then a green pixel on a red row (1 in the specification,
+        // written as 0, green for Adobe's reader).
         img.activeLeft = 11;
         img.cropWidth = 1000;
         writeDng(img, file);
         const std::string shiftedBytes = tiffreader::slurp(file);
         const tiffreader::Ifd shifted = tiffreader::parseIfd(
             shiftedBytes, tiffreader::parseFirstIfd(shiftedBytes).at(330).u32());
-        CHECK(shifted.at(51008).data.at(27) == 1);
+        CHECK(shifted.at(51008).data.at(27) == 0);
 
         // With a camera preview there are two sub-directories: raw, then JPEG.
         // (The test's JPEG is a few pixels small, so it has to be asked for:
