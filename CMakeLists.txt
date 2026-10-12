@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(dngconv VERSION 0.11.0 LANGUAGES CXX
+project(dngconv VERSION 0.11.1 LANGUAGES CXX
         DESCRIPTION "Camera raw to DNG converter")
 
 set(CMAKE_CXX_STANDARD 17)

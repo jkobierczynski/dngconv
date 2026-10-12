@@ -8,7 +8,7 @@ knows can be read. The DNG file itself is written by dngconv's own code: no
 Adobe DNG SDK, no libtiff, no libjpeg. The only dependencies are LibRaw and
 zlib, and, if JPEG XL compression is wanted, libjxl.
 
-Status: **0.11.0, early**. It works on the cameras listed under
+Status: **0.11.1, early**. It works on the cameras listed under
 [What has been tested](#what-has-been-tested); expect rough edges elsewhere.
 
 ## What it does

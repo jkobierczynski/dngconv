@@ -62,7 +62,11 @@ Axis planAxis(uint32_t size, uint32_t factor, uint32_t maxTile) {
 double lossyCurveEncode(double x) {
     // The inverse of f(y) = s y + (1 - s) y^3, in closed form (Cardano), as
     // in Adobe's SDK.
-    x = std::clamp(x, 0.0, 1.0);
+    // The ends exactly: the closed form leaves a rounding residue there
+    // whose sign depends on the maths library (0 on Linux, a hair above on
+    // macOS).
+    if (!(x > 0.0)) return 0.0;
+    if (x >= 1.0) return 1.0;
     static const double k0 = std::cbrt(2.0);
     static const double k1 = 108.0 * kS * kS * kS * (1.0 - kS) * (1.0 - kS) * (1.0 - kS);
     const double k2 = 27.0 * x * (1.0 - kS) * (1.0 - kS);

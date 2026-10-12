@@ -5,7 +5,7 @@ does; this file records the progress and the reasons behind the decisions, so
 that work can be picked up again without rediscovering them. What is left to
 do is in `TODO.md`.
 
-Last updated: 2026-10-12, at version 0.11.0.
+Last updated: 2026-10-12, at version 0.11.1.
 
 ## Status at a glance
 
@@ -535,6 +535,17 @@ Decisions:
   `check` command does not depend on it.
 - **Sixteen bits declared for every tile**, whatever the sensor's depth, as
   Adobe does. Declaring twelve would save the container, and little else.
+
+### 0.11.1 (2026-10-12): the curve on macOS
+
+The unit test of the lossy curve failed on GitHub's macOS runner: the
+closed form (Cardano) does not give exactly 0 for a linear value of 0, and
+the sign of what is left over depends on the maths library. On Linux it
+came out at or below 0 and was clamped; on macOS it was a hair above 0
+(Python's maths here gives +5.6e-17 too). Nothing a file holds changed,
+since such a value rounds to the stored value 0 anyway, but the ends are
+now returned exactly, 0 and 1, on every system. The test that caught it
+stays as it is.
 
 ### 0.11.0 (2026-10-12): lossy JPEG XL
 
